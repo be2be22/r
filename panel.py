@@ -458,21 +458,21 @@ async def fetch_railway_metrics():
         now = datetime.utcnow()
         start = now - timedelta(minutes=10)
         query = """
-        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String!, $serviceId: String, $groupBy: [MetricTag!]) {
-          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId, groupBy: $groupBy) {
+        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String, $serviceId: String) {
+          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId) {
             measurement
-            tags { serviceId }
             values { ts value }
           }
         }
         """
         variables = {
-            "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB", "DISK_USAGE_GB", "DISK_LIMIT_GB"],
+            # نکته: enum واقعی ریلوی "DISK_LIMIT_GB" ندارد (طبق introspection زنده) — همان چیزی که باعث
+            # خطای 400 می‌شد. دیسک محدودیت ثابتی روی ریلوی ندارد، فقط مقدار مصرفی (Ephemeral/Volume) دارد.
+            "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB", "EPHEMERAL_DISK_USAGE_GB", "DISK_USAGE_GB"],
             "startDate": start.isoformat() + "Z",
             "endDate": now.isoformat() + "Z",
             "environmentId": RAILWAY_ENVIRONMENT_ID,
             "serviceId": RAILWAY_SERVICE_ID,
-            "groupBy": ["SERVICE_ID"],
         }
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -496,8 +496,10 @@ async def fetch_railway_metrics():
         mem_limit = latest.get("MEMORY_LIMIT_GB", 0) or 0
         net_rx = latest.get("NETWORK_RX_GB", 0) or 0
         net_tx = latest.get("NETWORK_TX_GB", 0) or 0
-        disk_used = latest.get("DISK_USAGE_GB", 0) or 0
-        disk_limit = latest.get("DISK_LIMIT_GB", 0) or 0
+        # دیسک: اول مصرف Ephemeral (فضای کانتینر، چیزی که معمولاً پر می‌شود) را در نظر می‌گیریم؛
+        # اگر صفر بود یعنی شاید یک Volume جدا وصل است، آن مقدار را نشان می‌دهیم. ریلوی برای هیچ‌کدام
+        # عدد "سقف" مشخصی برنمی‌گرداند، پس فقط مقدار مصرفی (GB) نشان داده می‌شود نه درصد.
+        disk_used = latest.get("EPHEMERAL_DISK_USAGE_GB", 0) or latest.get("DISK_USAGE_GB", 0) or 0
 
         railway_metrics.update({
             "available": True,
@@ -505,8 +507,8 @@ async def fetch_railway_metrics():
             "mem_used_gb": round(mem_used, 2), "mem_limit_gb": round(mem_limit, 2),
             "net_rx_gb": round(net_rx, 3), "net_tx_gb": round(net_tx, 3),
             "net_bytes": int((net_rx + net_tx) * (1024 ** 3)),
-            "disk_used_gb": round(disk_used, 2), "disk_limit_gb": round(disk_limit, 2),
-            "disk_pct": round(disk_used / disk_limit * 100, 1) if disk_limit else 0,
+            "disk_used_gb": round(disk_used, 2), "disk_limit_gb": 0,
+            "disk_pct": 0,
             "updated": time.time(),
         })
     except Exception as e:
@@ -751,9 +753,9 @@ def _gql_type_str(t):
 
 async def railway_introspect():
     """
-    وقتی کوئری metrics خطا می‌دهد، به‌جای حدس‌زدن دوباره، مستقیم از خود اسکیمای گرافیک‌کیوال ریلوی
-    می‌پرسیم: اسم دقیق فیلد متریک‌ها چیست، چه آرگومان‌هایی می‌گیرد، و مقادیر مجاز enum اندازه‌گیری‌ها
-    (MetricMeasurement) و گروه‌بندی (MetricTag) چیست. این خودِ اسکیمای زنده ریلویه، نه حدس.
+    وقتی کوئری metrics خطا می‌دهد، کل اسکیمای ریلوی (همه تایپ‌ها) را می‌خوانیم و فقط تایپ‌های
+    مرتبط با Metric را فیلتر می‌کنیم. این‌طوری هم آرگومان‌های فیلد metrics و هم خودِ فیلدهای
+    دقیق نوع برگشتی‌اش (مثلاً MetricResult/MetricValue/MetricTags) را می‌بینیم — نه فقط حدس.
     """
     introspect_query = """
     query Introspect {
@@ -761,22 +763,23 @@ async def railway_introspect():
         queryType {
           fields {
             name
-            args {
-              name
-              type { ...T }
-            }
+            args { name type { ...T } }
           }
         }
+        types {
+          name
+          kind
+          fields { name type { ...T } }
+          enumValues { name }
+        }
       }
-      measurementEnum: __type(name: "MetricMeasurement") { name enumValues { name } }
-      tagEnum: __type(name: "MetricTag") { name enumValues { name } }
     }
     fragment T on __Type {
       kind name
-      ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+      ofType { kind name ofType { kind name ofType { kind name } } }
     }
     """
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             RAILWAY_GRAPHQL_URL, json={"query": introspect_query},
             headers={"Authorization": f"Bearer {RAILWAY_API_TOKEN}", "Content-Type": "application/json"},
@@ -784,18 +787,25 @@ async def railway_introspect():
     body = resp.json()
     if "errors" in body:
         return {"introspection_error": body["errors"]}
-    data = body.get("data") or {}
-    fields = ((data.get("__schema") or {}).get("queryType") or {}).get("fields") or []
+    schema = (body.get("data") or {}).get("__schema") or {}
+    root_fields = (schema.get("queryType") or {}).get("fields") or []
     metric_fields = []
-    for f in fields:
+    for f in root_fields:
         if "metric" in (f.get("name") or "").lower():
             args = [{"name": a["name"], "type": _gql_type_str(a.get("type"))} for a in (f.get("args") or [])]
             metric_fields.append({"name": f["name"], "args": args})
-    return {
-        "metric_query_fields": metric_fields,
-        "MetricMeasurement_values": [v["name"] for v in (data.get("measurementEnum") or {}).get("enumValues", []) or []],
-        "MetricTag_values": [v["name"] for v in (data.get("tagEnum") or {}).get("enumValues", []) or []],
-    }
+
+    metric_types = []
+    for t in (schema.get("types") or []):
+        if "metric" in (t.get("name") or "").lower():
+            entry = {"name": t.get("name"), "kind": t.get("kind")}
+            if t.get("fields"):
+                entry["fields"] = [{"name": fl["name"], "type": _gql_type_str(fl.get("type"))} for fl in t["fields"]]
+            if t.get("enumValues"):
+                entry["enumValues"] = [v["name"] for v in t["enumValues"]]
+            metric_types.append(entry)
+
+    return {"metric_query_fields": metric_fields, "metric_types": metric_types}
 
 @app.get("/api/railway-test")
 async def railway_test(token: Optional[str] = Cookie(None)):
@@ -820,21 +830,19 @@ async def railway_test(token: Optional[str] = Cookie(None)):
         now = datetime.utcnow()
         start = now - timedelta(minutes=10)
         query = """
-        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String!, $serviceId: String, $groupBy: [MetricTag!]) {
-          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId, groupBy: $groupBy) {
+        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String, $serviceId: String) {
+          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId) {
             measurement
-            tags { serviceId }
             values { ts value }
           }
         }
         """
         variables = {
-            "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB", "DISK_USAGE_GB", "DISK_LIMIT_GB"],
+            "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB", "EPHEMERAL_DISK_USAGE_GB", "DISK_USAGE_GB"],
             "startDate": start.isoformat() + "Z",
             "endDate": now.isoformat() + "Z",
             "environmentId": RAILWAY_ENVIRONMENT_ID,
             "serviceId": RAILWAY_SERVICE_ID,
-            "groupBy": ["SERVICE_ID"],
         }
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
