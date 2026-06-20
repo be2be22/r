@@ -430,15 +430,16 @@ async def stats_updater():
 # داخلی‌ای استفاده شده که خودِ داشبورد ریلوی هم استفاده می‌کند. اگر روزی ریلوی این را تغییر دهد،
 # این بخش فقط بی‌صدا غیرفعال می‌شود (available=False) و بقیه پنل کاملاً سالم کار می‌کند.
 async def fetch_railway_metrics():
-    if not RAILWAY_API_TOKEN or not RAILWAY_SERVICE_ID:
+    if not RAILWAY_API_TOKEN or not RAILWAY_SERVICE_ID or not RAILWAY_ENVIRONMENT_ID:
         return
     try:
         now = datetime.utcnow()
         start = now - timedelta(minutes=10)
         query = """
-        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String, $serviceId: String, $sampleRateSeconds: Int) {
-          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId, sampleRateSeconds: $sampleRateSeconds) {
+        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String!, $serviceId: String, $groupBy: [MetricTag!]) {
+          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId, groupBy: $groupBy) {
             measurement
+            tags { serviceId }
             values { ts value }
           }
         }
@@ -447,9 +448,9 @@ async def fetch_railway_metrics():
             "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB", "DISK_USAGE_GB", "DISK_LIMIT_GB"],
             "startDate": start.isoformat() + "Z",
             "endDate": now.isoformat() + "Z",
-            "environmentId": RAILWAY_ENVIRONMENT_ID or None,
+            "environmentId": RAILWAY_ENVIRONMENT_ID,
             "serviceId": RAILWAY_SERVICE_ID,
-            "sampleRateSeconds": 60,
+            "groupBy": ["SERVICE_ID"],
         }
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -491,8 +492,8 @@ async def fetch_railway_metrics():
         railway_metrics["available"] = False
 
 async def railway_metrics_updater():
-    if not RAILWAY_API_TOKEN or not RAILWAY_SERVICE_ID:
-        return  # اگر توکن ست نشده، اصلاً این تسک سبک حلقه نمی‌زند
+    if not RAILWAY_API_TOKEN or not RAILWAY_SERVICE_ID or not RAILWAY_ENVIRONMENT_ID:
+        return  # اگر توکن یا environment_id ست نشده، اصلاً این تسک سبک حلقه نمی‌زند
     while True:
         await fetch_railway_metrics()
         await asyncio.sleep(60)  # هر ۶۰ ثانیه؛ سبک و بدون فشار به CPU/رم
@@ -709,13 +710,17 @@ async def railway_test(token: Optional[str] = Cookie(None)):
     if not RAILWAY_SERVICE_ID:
         out["result"] = "RAILWAY_SERVICE_ID خوانده نشد (باید خودکار توسط ریلوی ست شود؛ یعنی این پنل احتمالاً خارج از ریلوی اجرا می‌شود یا نیاز به Redeploy دارد)."
         return out
+    if not RAILWAY_ENVIRONMENT_ID:
+        out["result"] = "RAILWAY_ENVIRONMENT_ID خوانده نشد (باید خودکار توسط ریلوی ست شود؛ نیاز به Redeploy دارد)."
+        return out
     try:
         now = datetime.utcnow()
         start = now - timedelta(minutes=10)
         query = """
-        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String, $serviceId: String, $sampleRateSeconds: Int) {
-          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId, sampleRateSeconds: $sampleRateSeconds) {
+        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String!, $serviceId: String, $groupBy: [MetricTag!]) {
+          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId, groupBy: $groupBy) {
             measurement
+            tags { serviceId }
             values { ts value }
           }
         }
@@ -724,9 +729,9 @@ async def railway_test(token: Optional[str] = Cookie(None)):
             "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB", "DISK_USAGE_GB", "DISK_LIMIT_GB"],
             "startDate": start.isoformat() + "Z",
             "endDate": now.isoformat() + "Z",
-            "environmentId": RAILWAY_ENVIRONMENT_ID or None,
+            "environmentId": RAILWAY_ENVIRONMENT_ID,
             "serviceId": RAILWAY_SERVICE_ID,
-            "sampleRateSeconds": 60,
+            "groupBy": ["SERVICE_ID"],
         }
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -963,7 +968,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
   <div class="stats-grid">
     <div class="stat-card"><div class="stat-icon">👤</div><div class="stat-val" id="s-total">—</div><div class="stat-label">کل کاربران</div></div>
     <div class="stat-card"><div class="stat-icon">🌐</div><div class="stat-val" id="s-connected">—</div><div class="stat-label">کل ایپی‌ها</div></div>
-    <div class="stat-card"><div class="stat-icon">🔥</div><div class="stat-val" id="s-online">—</div><div class="stat-label">ایپی‌های فعال</div></div>
+    <div class="stat-card"><div class="stat-icon">🟢</div><div class="stat-val" id="s-online">—</div><div class="stat-label">کاربران آنلاین</div></div>
     <div class="stat-card"><div class="stat-icon">📦</div><div class="stat-val" id="s-bytes">—</div><div class="stat-label">ترافیک Xray</div></div>
     <div class="stat-card"><div class="stat-icon">🚂</div><div class="stat-val" id="s-railway-traffic">—</div><div class="stat-label">ترافیک ریلوی</div></div>
     <div class="stat-card"><div class="stat-icon">🧮</div><div class="stat-val" id="s-total-combined">—</div><div class="stat-label">ترافیک کل (Xray + ریلوی)</div></div>
@@ -1002,7 +1007,7 @@ async function logout(){await fetch('/api/logout',{method:'POST'});location.href
 async function loadStats(){try{const r=await fetch('/api/stats',{credentials:'include'});if(r.status===401){location.href='__LOGIN_URL__';return}const d=await r.json();
 document.getElementById('s-total').textContent=d.total_users;
 document.getElementById('s-connected').textContent=d.total_connected;
-document.getElementById('s-online').textContent=d.active_ips;
+document.getElementById('s-online').textContent=d.active_uuids;
 document.getElementById('s-bytes').textContent=fmtBytes(d.bytes);
 document.getElementById('s-dl').textContent=fmtSpeed(d.dl_speed);
 document.getElementById('s-ul').textContent=fmtSpeed(d.ul_speed);
