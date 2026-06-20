@@ -123,10 +123,19 @@ def is_public_ip(ip: str) -> bool:
 
 def rate_limiter(ip: str, action: str, limit: int = 5, timeframe: int = 10):
     now = time.time()
-    # پاکسازی خودکار برای جلوگیری از پر شدن رم
+    # پاکسازی واقعی entryهای قدیمی (به‌جای پاک کردن کامل دیکشنری وقتی به ۲۰۰ آیپی می‌رسد).
+    # نکته مهم دربارهٔ نسخهٔ قبلی: RATE_LIMITS.clear() کل تاریخچهٔ rate-limit همهٔ آیپی‌ها را
+    # یکجا پاک می‌کرد، نه فقط آیپی‌های قدیمی — یعنی با ۱۰۰+ کاربر (که خیلی‌هاشان پشت یک
+    # CGNAT/NAT مشترک هستند و آیپی محدودی دارند) به‌محض رسیدن به ۲۰۰ کلید، تمام rate-limitها
+    # یکجا ریست می‌شد و عملاً محافظت بی‌اثر می‌شد. اینجا فقط actionهایی که در timeframe خودشان
+    # دیگر هیچ timestamp فعالی ندارند حذف می‌شوند، و رشد دیکشنری واقعاً محدود می‌ماند.
     if len(RATE_LIMITS) > 200:
-        RATE_LIMITS.clear()
-        
+        for k in list(RATE_LIMITS.keys()):
+            for a in list(RATE_LIMITS[k].keys()):
+                RATE_LIMITS[k][a] = [t for t in RATE_LIMITS[k][a] if now - t < timeframe]
+                if not RATE_LIMITS[k][a]: del RATE_LIMITS[k][a]
+            if not RATE_LIMITS[k]: del RATE_LIMITS[k]
+
     if ip not in RATE_LIMITS: RATE_LIMITS[ip] = {}
     if action not in RATE_LIMITS[ip]: RATE_LIMITS[ip][action] = []
     RATE_LIMITS[ip][action] = [t for t in RATE_LIMITS[ip][action] if now - t < timeframe]
@@ -275,18 +284,39 @@ def load_data():
     if updated: save_links()
 
 def save_links():
-    with open(LINKS_FILE, "w") as f: json.dump(LINKS, f)
+    # نکته مهم: save_links حالا می‌تواند هم از thread اصلی (event loop) و هم از داخل
+    # sync_xray_config در یک executor thread جدا صدا زده شود. json.dump از دیکشنری LINKS
+    # مستقیماً پیمایش می‌کند؛ اگر هم‌زمان thread دیگری یک کلید اضافه/حذف کند (create_link/delete_link)
+    # ممکن است RuntimeError بدهد. dict(LINKS) یک کپی سطحی فوری و atomic (تحت GIL) می‌گیرد.
+    with open(LINKS_FILE, "w") as f: json.dump(dict(LINKS), f)
 
 def save_stats():
+    # نکته مهم: این تابع حالا معمولاً از طریق save_stats_async در یک executor thread جدا اجرا
+    # می‌شود، درحالی‌که event loop اصلی (stats_updater و سایر endpointها) هم‌زمان می‌توانند
+    # user_traffic را آپدیت کنند یا به total_unique_ips آیپی اضافه کنند. list(...)/dict(...)
+    # اینجا یک snapshot فوری (atomic زیر GIL) می‌گیرند تا پیمایش وسط تغییر اندازه به خطا نخورد.
+    total_ips_snapshot = list(total_unique_ips)
+    user_traffic_snapshot = dict(user_traffic)
     with open(STATS_FILE, "w") as f:
         json.dump({
-            "total_unique_ips": list(total_unique_ips), "bytes": stats["bytes"], "start": stats["start"],
-            "user_traffic": user_traffic, "reality_priv": reality_keys["priv"], "reality_pub": reality_keys["pub"],
+            "total_unique_ips": total_ips_snapshot, "bytes": stats["bytes"], "start": stats["start"],
+            "user_traffic": user_traffic_snapshot, "reality_priv": reality_keys["priv"], "reality_pub": reality_keys["pub"],
             "railway_net_rx_total_gb": railway_metrics.get("net_rx_total_gb", 0),
             "railway_net_tx_total_gb": railway_metrics.get("net_tx_total_gb", 0),
             "railway_net_rx_last_ts": railway_metrics.get("net_rx_last_ts", 0),
             "railway_net_tx_last_ts": railway_metrics.get("net_tx_last_ts", 0),
         }, f)
+
+async def save_stats_async():
+    """
+    نسخهٔ async برای فراخوانی از داخل event loop (مثلاً stats_updater).
+    save_stats() معمولی نوشتن فایل سینک (بلاکینگ دیسک I/O) است؛ هر بار که از داخل
+    یک کوروتین صدا زده می‌شد، با user_traffic بزرگ (۱۰۰ کاربر) برای چند میلی‌ثانیه
+    event loop را قفل می‌کرد. اینجا با run_in_executor به یک thread جدا منتقل می‌شود
+    تا هندل کردن ریکوئست‌های HTTP هم‌زمان معطل نماند.
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, save_stats)
 
 def generate_reality_keys():
     global reality_keys
@@ -330,7 +360,11 @@ def sync_xray_config():
     
     active_links = {}
     reality_snis = set()
-    for uid, info in LINKS.items():
+    # نکته مهم: این تابع حالا از طریق sync_xray_config_async در یک thread جدا (executor) اجرا می‌شود،
+    # درحالی‌که event loop اصلی هم‌زمان می‌تواند LINKS را تغییر دهد (مثلاً create_link/delete_link).
+    # list(...) اینجا یک snapshot فوری از items می‌گیرد تا اگر دیکشنری وسط پیمایش توسط thread دیگری
+    # تغییر اندازه دهد، خطای «dictionary changed size during iteration» رخ ندهد.
+    for uid, info in list(LINKS.items()):
         if info.get("status") in ["expired", "blocked"]: continue
         if info.get("expiry_time") and time.time() > info["expiry_time"]:
             info["status"] = "expired"; continue
@@ -402,18 +436,81 @@ def sync_xray_config():
                                          env=get_xray_env())
     except: pass
 
+# لاک برای جلوگیری از فراخوانی همزمان sync_xray_config از چند جا (مثلاً وقتی یک کاربر هم‌زمان
+# با تیک ۱۵ ثانیه‌ای stats_updater، یک API ریکوئست هم لینک جدید می‌سازد). بدون این لاک، دو
+# thread/کوروتین می‌توانند هم‌زمان xray_process را terminate/spawn کنند و یک پروسهٔ Xray یتیم
+# (orphan) یا حالت ناپایدار بسازند که به‌مرور رم زیادی مصرف می‌کند.
+_xray_restart_lock = asyncio.Lock()
+
+async def sync_xray_config_async():
+    """
+    نسخهٔ async برای فراخوانی از مسیر هندل کردن ریکوئست‌های HTTP و از stats_updater.
+    sync_xray_config() پروسهٔ Xray را kill/spawn می‌کند و فایل کانفیگ را روی دیسک می‌نویسد —
+    هر دو عملیات بلاکینگ هستند. قبلاً این تابع مستقیماً (سینک) از داخل endpointهای async مثل
+    create_link/edit_link/delete_link و از حلقهٔ stats_updater صدا زده می‌شد؛ یعنی هر بار که
+    کاربری لینک می‌ساخت/حذف می‌کرد یا یک کاربر expire می‌شد، کل event loop برای مدتی (kill
+    پروسهٔ قبلی Xray + ساخت پروسهٔ جدید با ۸ inbound و صدها client) قفل می‌شد و همان لحظه هیچ
+    درخواست دیگری (ساب‌اسکریپشن/پنل) پاسخ نمی‌گرفت. اینجا با run_in_executor در thread جدا
+    اجرا می‌شود، و با _xray_restart_lock تضمین می‌شود دو ری‌استارت هم‌زمان رخ ندهد.
+    """
+    async with _xray_restart_lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, sync_xray_config)
+
+def _read_log_segment_sync(path, pos, max_size):
+    """
+    خواندن سینک یک بخش از فایل لاگ (truncate در صورت بزرگ شدن بیش از max_size، سیک به pos،
+    خواندن داده‌های جدید). این تابع عمداً sync نوشته شده تا بتوان آن را با run_in_executor
+    در یک thread جدا اجرا کرد — چون با ۱۰۰ کاربر روی ۸ پروتکل، فایل لاگ Xray/Nginx می‌تواند
+    هر ۱۵ ثانیه چند صد کیلوبایت تا چند مگابایت داده جدید داشته باشد و خواندن سینک آن مستقیماً
+    روی event loop اصلی، باعث می‌شد در همان لحظه پاسخ به ریکوئست‌های HTTP کاربران معطل بماند.
+    خروجی: (new_data: str, new_pos: int)
+    """
+    if not os.path.exists(path):
+        return "", pos
+    if os.path.getsize(path) > max_size:
+        open(path, 'w').close()
+        pos = 0
+    current_size = os.path.getsize(path)
+    if current_size < pos:
+        pos = 0
+    with open(path, "r") as f:
+        f.seek(pos)
+        new_data = f.read()
+        new_pos = f.tell()
+    return new_data, new_pos
+
+async def _read_log_segment_async(path, pos, max_size):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _read_log_segment_sync, path, pos, max_size)
+
 async def stats_updater():
     global xray_log_pos, nginx_log_pos
     await asyncio.sleep(5)
     while True:
         get_sys_info()
-        if xray_process and xray_process.poll() is not None: sync_xray_config()
+        if xray_process and xray_process.poll() is not None: await sync_xray_config_async()
 
         # ۱. خواندن ترافیک از Xray API (هر ۱۵ ثانیه)
+        # نکته مهم: قبلاً اینجا subprocess.run (بلاکینگ) صدا زده می‌شد که با ۱۰۰+ کاربر
+        # و ۸ پروتکل همزمان، کل event loop اصلی (همان loopی که همه ریکوئست‌های HTTP/ساب‌اسکریپشن/پنل
+        # رو هم سرویس می‌دهد) را برای صدها میلی‌ثانیه تا چند ثانیه کامل می‌بست — یعنی در همان لحظه
+        # هیچ کاربری نمی‌توانست ساب‌اسکریپشن بگیرد یا به پنل وصل شود. با asyncio.create_subprocess_exec
+        # این subprocess به‌صورت ناهمزمان اجرا می‌شود و event loop آزاد می‌ماند.
         try:
-            result = subprocess.run(["/usr/local/bin/xray", "api", "statsquery", f"--server=127.0.0.1:{XRAY_API_PORT}", "-reset"], capture_output=True, text=True, timeout=3)
-            if result.stdout:
-                data = json.loads(result.stdout)
+            proc = await asyncio.create_subprocess_exec(
+                "/usr/local/bin/xray", "api", "statsquery", f"--server=127.0.0.1:{XRAY_API_PORT}", "-reset",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            )
+            try:
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except Exception: pass
+                stdout_bytes = b""
+            stdout_text = stdout_bytes.decode("utf-8", "ignore") if stdout_bytes else ""
+            if stdout_text:
+                data = json.loads(stdout_text)
                 for stat in data.get("stat", []):
                     name  = stat.get("name", "")
                     value = int(stat.get("value", "0") or "0")
@@ -437,7 +534,7 @@ async def stats_updater():
                         # کاربر را نشان می‌دهد یا نه، دقیقاً می‌فهمیم همین الان از کدام پروتکل ترافیک رد شده.
                         tag = parts[1]
                         if value > 0: inbound_last_active[tag] = time.time()
-            save_stats()
+            await save_stats_async()
         except: pass
 
         # ۲. خواندن ترافیک از لاگ Nginx (و تشخیص ایپی واقعی فعال هر پروتکل: ws/xhttp/grpc/hu/trojan/vmess)
@@ -445,12 +542,8 @@ async def stats_updater():
         # پس $remote_addr همان ایپی داخلی پلتفرم است نه ایپی واقعی کاربر؛ ایپی واقعی در هدر X-Forwarded-For می‌آید.
         # اگر $remote_addr خودش عمومی بود (یعنی نگینکس مستقیم در معرض اینترنت است) همان قابل اعتمادتر است.
         try:
-            if os.path.exists(NGINX_LOG):
-                if os.path.getsize(NGINX_LOG) > 1 * 1024 * 1024: open(NGINX_LOG, 'w').close(); nginx_log_pos = 0
-                current_size = os.path.getsize(NGINX_LOG)
-                if current_size < nginx_log_pos: nginx_log_pos = 0
-                with open(NGINX_LOG, "r") as f:
-                    f.seek(nginx_log_pos); new_data = f.read(); nginx_log_pos = f.tell()
+            new_data, nginx_log_pos = await _read_log_segment_async(NGINX_LOG, nginx_log_pos, 1 * 1024 * 1024)
+            if new_data:
                 now_t1 = time.time()
                 for line in new_data.splitlines():
                     fields = line.strip().split("|")
@@ -479,14 +572,8 @@ async def stats_updater():
         # برای Reality ایپی واقعی هم استخراج می‌شود (چون مستقیم به Xray وصل می‌شود).
         # برای WS/XHTTP/gRPC/... ایپی 127.0.0.1 است (چون از Nginx رد شده) — ایپی واقعی از لاگ Nginx خوانده می‌شود.
         try:
-            if os.path.exists(XRAY_LOG):
-                if os.path.getsize(XRAY_LOG) > 5 * 1024 * 1024:
-                    open(XRAY_LOG, 'w').close(); xray_log_pos = 0
-                current_size = os.path.getsize(XRAY_LOG)
-                if current_size < xray_log_pos: xray_log_pos = 0
-                with open(XRAY_LOG, "r") as f:
-                    f.seek(xray_log_pos); new_data = f.read(); xray_log_pos = f.tell()
-
+            new_data, xray_log_pos = await _read_log_segment_async(XRAY_LOG, xray_log_pos, 5 * 1024 * 1024)
+            if new_data:
                 now_t = time.time()
                 for m in XRAY_RE.finditer(new_data):
                     ip, tag, uid = m.group(1), m.group(2), m.group(3)
@@ -559,7 +646,7 @@ async def stats_updater():
             if info.get("expiry_time") and time.time() > info["expiry_time"]: needs_restart = True
             if info.get("data_limit") and user_traffic.get(uid, 0) >= info["data_limit"]: needs_restart = True
             
-        if needs_restart: sync_xray_config()
+        if needs_restart: await sync_xray_config_async()
             
         # افزایش زمان خواب از ۵ ثانیه به ۱۵ ثانیه برای کاهش فشار CPU
         await asyncio.sleep(15)
@@ -631,7 +718,7 @@ async def fetch_railway_metrics():
 
         net_rx_total = accumulate(results.get("NETWORK_RX_GB", []), "net_rx_total_gb", "net_rx_last_ts")
         net_tx_total = accumulate(results.get("NETWORK_TX_GB", []), "net_tx_total_gb", "net_tx_last_ts")
-        save_stats()  # ذخیره شمارنده‌های تجمعی ترافیک ریلوی تا بین ری‌استارت‌ها از دست نروند
+        await save_stats_async()  # ذخیره شمارنده‌های تجمعی ترافیک ریلوی تا بین ری‌استارت‌ها از دست نروند
 
         railway_metrics.update({
             "available": True,
@@ -863,12 +950,32 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
         "combined_bytes": stats["bytes"] + railway_metrics["net_bytes"],
     }
 
+def _tail_file_sync(path, n_lines, max_read_bytes=256 * 1024):
+    """
+    فقط بخش انتهایی فایل را می‌خواند (نه کل فایل) تا n_lines خط آخر را برگرداند.
+    قبلاً اینجا f.readlines() کل فایل لاگ Xray را به حافظه می‌آورد و فقط ۵۰ خط آخرش
+    استفاده می‌شد؛ با ۱۰۰ کاربر روی ۸ پروتکل، این فایل می‌تواند چند مگابایت باشد و این کار
+    باعث یک اسپایک ناگهانی رم (و کند شدن) فقط برای نمایش ۵۰ خط در پنل ادمین می‌شد.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            seek_to = max(0, size - max_read_bytes)
+            f.seek(seek_to)
+            data = f.read()
+        text = data.decode("utf-8", "ignore")
+        lines = text.splitlines()
+        return [l + "\n" for l in lines[-n_lines:]]
+    except Exception:
+        return []
+
 @app.get("/api/logs")
 async def api_logs(token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     logs = []
     if os.path.exists(XRAY_LOG):
-        with open(XRAY_LOG, "r") as f: logs.extend(f.readlines()[-50:])
+        loop = asyncio.get_running_loop()
+        logs.extend(await loop.run_in_executor(None, _tail_file_sync, XRAY_LOG, 50))
     if error_log:
         logs.append("──── آخرین خطاهای پنل (شامل دیباگ ریلوی) ────")
         for e in list(error_log)[-15:]:
@@ -1050,7 +1157,7 @@ async def create_link(request: Request, token: Optional[str] = Cookie(None)):
     if gb > 0: info["data_limit"] = int(gb * 1024 * 1024 * 1024)
     
     LINKS[uid] = info
-    save_links(); sync_xray_config(); domain = get_domain(request)
+    save_links(); await sync_xray_config_async(); domain = get_domain(request)
     return {"ok": True, "uuid": uid, **make_links(uid, domain, label, sni, short_id, clean_ip)}
 
 @app.post("/api/links/{uid}/edit")
@@ -1069,7 +1176,7 @@ async def edit_link(uid: str, request: Request, token: Optional[str] = Cookie(No
     else: LINKS[uid].pop("data_limit", None)
         
     LINKS[uid]["status"] = "active"
-    save_links(); sync_xray_config(); return {"ok": True}
+    save_links(); await sync_xray_config_async(); return {"ok": True}
 
 @app.post("/api/links/{uid}/extend")
 async def extend_link(uid: str, token: Optional[str] = Cookie(None)):
@@ -1078,7 +1185,7 @@ async def extend_link(uid: str, token: Optional[str] = Cookie(None)):
     if "expiry_time" in LINKS[uid] and LINKS[uid]["expiry_time"] > time.time(): LINKS[uid]["expiry_time"] += 30 * 86400
     else: LINKS[uid]["expiry_time"] = time.time() + 30 * 86400
     LINKS[uid]["status"] = "active"
-    save_links(); sync_xray_config(); return {"ok": True}
+    save_links(); await sync_xray_config_async(); return {"ok": True}
 
 @app.post("/api/links/{uid}/reset")
 async def reset_traffic(uid: str, token: Optional[str] = Cookie(None)):
@@ -1086,20 +1193,20 @@ async def reset_traffic(uid: str, token: Optional[str] = Cookie(None)):
     if uid not in LINKS: raise HTTPException(404)
     user_traffic[uid] = 0
     LINKS[uid]["status"] = "active"
-    save_stats(); save_links(); sync_xray_config(); return {"ok": True}
+    await save_stats_async(); save_links(); await sync_xray_config_async(); return {"ok": True}
 
 @app.post("/api/cleanup")
 async def cleanup_users(token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     global LINKS
     LINKS = {uid: info for uid, info in LINKS.items() if info.get("status") != "expired"}
-    save_links(); sync_xray_config(); return {"ok": True}
+    save_links(); await sync_xray_config_async(); return {"ok": True}
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     if uid == MASTER_UUID: raise HTTPException(403, "کاربر اصلی قابل حذف نیست")
-    LINKS.pop(uid, None); save_links(); sync_xray_config(); return {"ok": True}
+    LINKS.pop(uid, None); save_links(); await sync_xray_config_async(); return {"ok": True}
 
 @app.post("/api/change-password")
 async def change_pass(request: Request, token: Optional[str] = Cookie(None)):
@@ -1127,7 +1234,7 @@ async def restore_data(request: Request, token: Optional[str] = Cookie(None)):
             stats["bytes"] = s.get("bytes", 0); stats["start"] = s.get("start", time.time())
             user_traffic = s.get("user_traffic", {})
             if "reality_priv" in s: reality_keys["priv"] = s["reality_priv"]; reality_keys["pub"] = s["reality_pub"]
-        save_links(); save_stats(); sync_xray_config()
+        save_links(); await save_stats_async(); await sync_xray_config_async()
         return {"ok": True}
     except: raise HTTPException(400, "Invalid Backup")
 
@@ -1421,7 +1528,7 @@ async def bot_webhook(req: Request):
 
                 LINKS[uid] = info
                 save_links()
-                sync_xray_config()
+                await sync_xray_config_async()
 
                 domain = PUBLIC_HOST or "your-domain.com"
                 sub_link = f"https://{domain}/sub/{short_id}"
