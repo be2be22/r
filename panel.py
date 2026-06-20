@@ -23,6 +23,9 @@ NGINX_LOG    = "/tmp/nginx_access.log"
 STATS_FILE   = "/app/stats.json"
 XRAY_API_PORT = 10085
 
+# سقف فرضی پهنای باند برای محاسبه‌ی Network Load Index (٪) — قابل تنظیم با Variable در ریلوی
+NETWORK_LOAD_CAP_MBPS = float(os.environ.get("NETWORK_LOAD_CAP_MBPS", "50"))
+
 XRAY_WS_PORT = 18080
 XRAY_XH_PORT = 18081
 XRAY_GRPC_PORT = 18083
@@ -744,6 +747,12 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     active_configs = build_active_configs()
     total_active_ips = sum(it["ip_count"] for it in active_configs)
+
+    # Network Load Index (٪): سرعت لحظه‌ای (دانلود+آپلود) نسبت به سقف NETWORK_LOAD_CAP_MBPS
+    cap_bytes_per_sec = (NETWORK_LOAD_CAP_MBPS * 1024 * 1024) / 8
+    current_load_bps = stats.get("dl_speed", 0) + stats.get("ul_speed", 0)
+    network_load_index = min(100, round((current_load_bps / cap_bytes_per_sec) * 100)) if cap_bytes_per_sec > 0 else 0
+
     return {
         "total_users": len(LINKS),
         "total_connected": len(total_unique_ips),
@@ -755,6 +764,9 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
         "uptime": uptime_str(),
         "ram": sys_info["ram"],
         "cpu": sys_info["cpu"],
+        "cpu_score": sys_info["cpu"],
+        "ram_efficiency": sys_info["ram"],
+        "network_load_index": network_load_index,
         "active_configs": active_configs,
         "railway_available": railway_metrics["available"],
         "railway_ram_pct": railway_metrics["ram_pct"],
@@ -1127,6 +1139,9 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
     <div class="stat-card"><div class="stat-icon">⚙️</div><div class="stat-val" id="s-cpu">—</div><div class="stat-label">پردازنده (%)</div></div>
     <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-railway-ram">—</div><div class="stat-label">رم ریلوی (%)</div></div>
     <div class="stat-card"><div class="stat-icon">💾</div><div class="stat-val" id="s-railway-disk">—</div><div class="stat-label">دیسک کانتینر</div></div>
+    <div class="stat-card"><div class="stat-icon">⚡</div><div class="stat-val" id="s-cpu-score">—</div><div class="stat-label">CPU Score (%)</div></div>
+    <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-ram-efficiency">—</div><div class="stat-label">RAM Efficiency (%)</div></div>
+    <div class="stat-card"><div class="stat-icon">🌐</div><div class="stat-val" id="s-network-load">—</div><div class="stat-label">Network Load Index (%)</div></div>
   </div>
 
   <!-- باکس کانفیگ‌های فعال -->
@@ -1164,6 +1179,9 @@ document.getElementById('s-ram').textContent=d.ram+'%';
 document.getElementById('s-cpu').textContent=d.cpu+'%';
 document.getElementById('s-total-combined').textContent=fmtBytes(d.combined_bytes);
 document.getElementById('s-railway-disk').textContent=d.disk_used_gb+' / '+d.disk_total_gb+' GB ('+d.disk_pct+'%)';
+document.getElementById('s-cpu-score').textContent=d.cpu_score+'%';
+document.getElementById('s-ram-efficiency').textContent=d.ram_efficiency+'%';
+document.getElementById('s-network-load').textContent=d.network_load_index+'%';
 if(d.railway_available){
 document.getElementById('s-railway-traffic').textContent=fmtBytes(d.railway_net_bytes);
 document.getElementById('s-railway-ram').textContent=d.railway_ram_pct+'%';
@@ -1368,6 +1386,67 @@ if __name__ == "__main__":
 # ─────────────────────────────────────────────
 
 from fastapi.responses import HTMLResponse
+
+@app.get("/dashboard")
+def dashboard():
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>XRAY Dashboard</title>
+    <style>
+        body { background:#0b1220; color:#e5e7eb; font-family:Arial; padding:20px; }
+        .card { background:#111827; padding:15px; margin:10px 0; border-radius:12px; }
+        .bar { width:100%; height:10px; background:#374151; border-radius:6px; overflow:hidden; }
+        .fill { height:100%; background:#22c55e; width:0%; }
+        .blue { background:#3b82f6; }
+        .red { background:#ef4444; }
+        h1 { font-size:20px; }
+    </style>
+</head>
+<body>
+
+<h1>⚡ XRAY Live Dashboard (Optimized)</h1>
+
+<div class="card">
+CPU Usage
+<div class="bar"><div id="cpu" class="fill"></div></div>
+</div>
+
+<div class="card">
+RAM Usage
+<div class="bar"><div id="ram" class="fill blue"></div></div>
+</div>
+
+<div class="card">
+Disk Usage
+<div class="bar"><div id="disk" class="fill red"></div></div>
+</div>
+
+<div class="card">
+Active Users: <span id="users">0</span>
+</div>
+
+<script>
+async function load(){
+    let r = await fetch('/api/ui-stats');
+    let d = await r.json();
+
+    document.getElementById('cpu').style.width = d.cpu + "%";
+    document.getElementById('ram').style.width = d.ram + "%";
+    document.getElementById('disk').style.width = d.disk + "%";
+    document.getElementById('users').innerText = d.active;
+}
+
+setInterval(load, 2000);
+load();
+</script>
+
+</body>
+</html>
+    """
+    return HTMLResponse(html)
+
 
 @app.get("/api/ui-stats")
 def ui_stats():
