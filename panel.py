@@ -55,7 +55,7 @@ SESSIONS = {}
 LINKS = {}
 error_log = deque(maxlen=50)
 stats = {"bytes": 0, "bytes_prev": 0, "bytes_prev_time": time.time(), "dl_speed": 0, "ul_speed": 0, "start": time.time()}
-sys_info = {"ram": 0, "cpu": 0, "disk_used_gb": 0, "disk_total_gb": 0, "disk_pct": 0}
+sys_info = {"ram": 0, "cpu": 0, "disk_used_gb": 0, "disk_total_gb": 0, "disk_pct": 0, "ram_used_mb": 0, "ram_limit_mb": 0}
 prev_cpu = None
 xray_process = None
 xray_log_pos = 0
@@ -138,20 +138,85 @@ def sanitize_label(label: str) -> str:
     return re.sub(r'[^\w\s\-@.]', '', label)[:30]
 
 # ── System Info (RAM/CPU) ────────────────────────────────
+def get_cgroup_mem():
+    """
+    رم *واقعی کانتینر* را از خود cgroup می‌خواند (نه از /proc/meminfo که در داکر/ریلوی
+    رم کل ماشین میزبان را نشان می‌دهد، نه سهم این کانتینر).
+    این دقیقاً همان عددی است که کرنل برای OOM-kill کردن کانتینر استفاده می‌کند، پس با
+    چیزی که در داشبورد ریلوی می‌بینید (که می‌رود بالای ۹۰٪ و کرش می‌کند) یکی است؛
+    بر خلاف /proc/meminfo که چون رم کل ماشین فیزیکی زیرین را نشان می‌دهد، معمولاً
+    ثابت و کوچک به نظر می‌رسد (مثلاً همان ۴۰٪ ثابتی که در پنل می‌بینید) و اصلاً
+    فشار واقعی رم *این کانتینر* را نشان نمی‌دهد.
+    خروجی: (used_bytes, limit_bytes) یا None اگر هیچ محدودیت cgroup واقعی پیدا نشد
+    (یعنی خارج از کانتینر اجرا می‌شود، یا limit ست نشده).
+    """
+    def _read_stat_field(path, field):
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith(field + " "):
+                        return int(line.split()[1])
+        except Exception:
+            pass
+        return 0
+
+    # cgroup v2
+    try:
+        cur_path, max_path = "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"
+        if os.path.exists(cur_path) and os.path.exists(max_path):
+            with open(cur_path) as f: used = int(f.read().strip())
+            limit_raw = open(max_path).read().strip()
+            if limit_raw != "max":
+                limit = int(limit_raw)
+                # کش قابل‌بازیابی (inactive_file) را کم می‌کنیم تا فقط مصرف «واقعی» بماند
+                # (دقیقاً همان منطقی که docker stats / cAdvisor استفاده می‌کنند)
+                inactive_file = _read_stat_field("/sys/fs/cgroup/memory.stat", "inactive_file")
+                used_real = max(0, used - inactive_file)
+                if limit > 0:
+                    return used_real, limit
+    except Exception:
+        pass
+
+    # cgroup v1 (fallback برای هاست‌های قدیمی‌تر)
+    try:
+        cur_path = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+        max_path = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+        if os.path.exists(cur_path) and os.path.exists(max_path):
+            with open(cur_path) as f: used = int(f.read().strip())
+            with open(max_path) as f: limit = int(f.read().strip())
+            # اگر limit واقعی ست نشده باشد، یک عدد بسیار بزرگ (تقریباً unlimited) برمی‌گردد
+            if 0 < limit < 10 ** 14:
+                inactive_file = _read_stat_field("/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")
+                used_real = max(0, used - inactive_file)
+                return used_real, limit
+    except Exception:
+        pass
+    return None
+
 def get_sys_info():
     global prev_cpu
     try:
-        with open('/proc/meminfo', 'r') as f:
-            meminfo = {}
-            for line in f:
-                parts = line.split(':')
-                if len(parts) == 2:
-                    try: meminfo[parts[0].strip()] = int(parts[1].strip().split(' ')[0])
-                    except: pass
-        total = meminfo.get('MemTotal', 0)
-        available = meminfo.get('MemAvailable', 0)
-        if total > 0: sys_info["ram"] = int(((total - available) / total) * 100)
-            
+        cg = get_cgroup_mem()
+        if cg:
+            used, limit = cg
+            sys_info["ram"] = int(used / limit * 100) if limit else 0
+            sys_info["ram_used_mb"] = round(used / (1024 ** 2), 1)
+            sys_info["ram_limit_mb"] = round(limit / (1024 ** 2), 1)
+        else:
+            # fallback: خارج از کانتینر (مثلاً اجرای محلی) — رم کل ماشین را نشان بده
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = {}
+                for line in f:
+                    parts = line.split(':')
+                    if len(parts) == 2:
+                        try: meminfo[parts[0].strip()] = int(parts[1].strip().split(' ')[0])
+                        except: pass
+            total = meminfo.get('MemTotal', 0)
+            available = meminfo.get('MemAvailable', 0)
+            if total > 0: sys_info["ram"] = int(((total - available) / total) * 100)
+            sys_info["ram_used_mb"] = round((total - available) / 1024, 1) if total else 0
+            sys_info["ram_limit_mb"] = round(total / 1024, 1) if total else 0
+
         with open('/proc/stat', 'r') as f:
             parts = f.readline().split()[1:]
             parts = [int(x) for x in parts]
@@ -239,6 +304,26 @@ def generate_reality_keys():
         if reality_keys["priv"] and reality_keys["pub"]: save_stats()
     except: pass
 
+def get_xray_env():
+    """
+    Xray-core با Go نوشته شده؛ به‌صورت پیش‌فرض Go اجازه می‌دهد heap تا حدی بزرگ شود که
+    خودش صلاح می‌داند (می‌تواند چند برابر دادهٔ زنده باشد) — این یکی از دلایل اصلی است که
+    با ۱۰۰+ کاربر هم‌زمان، رم به‌سرعت بالا می‌رود و کانتینر OOM می‌شود.
+    با GOMEMLIMIT (یک سقف نرم برای heap، از Go 1.19 به بعد) به Go می‌گوییم خودش را به
+    درصدی از سقف *واقعی* همین کانتینر (که از cgroup خوانده می‌شود) محدود کند، و با GOGC
+    پایین‌تر، garbage collector را تهاجمی‌تر می‌کنیم (کمی CPU بیشتر، رم پایدار کمتر).
+    """
+    env = os.environ.copy()
+    cg = get_cgroup_mem()
+    if cg:
+        _, limit = cg
+        # حدود ۶۰٪ از سقف رم کانتینر به Xray اختصاص می‌دهیم؛ باقی برای Nginx + پنل پایتون + سیستم
+        xray_mem_cap = int(limit * 0.6)
+        if xray_mem_cap > 64 * 1024 * 1024:  # کمتر از این عدد بی‌معنی است
+            env["GOMEMLIMIT"] = str(xray_mem_cap)
+    env.setdefault("GOGC", "50")
+    return env
+
 def sync_xray_config():
     global xray_process
     generate_reality_keys()
@@ -283,7 +368,16 @@ def sync_xray_config():
         "log": {"loglevel": "info", "access": XRAY_LOG}, 
         "stats": {},
         "policy": {
-            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            # تنظیمات زیر برای جلوگیری از مصرف بی‌رویه رم وقتی تعداد زیادی کاربر هم‌زمان وصل می‌شوند اضافه شده:
+            # - connIdle پایین‌تر (۶۰ ثانیه به‌جای پیش‌فرض ۳۰۰ ثانیه): اتصالات بی‌کار سریع‌تر بسته می‌شوند
+            #   و رمشان آزاد می‌شود؛ با موبایل که مدام شبکه/وایفای عوض می‌کند خیلی از اتصالات نیمه‌باز
+            #   می‌مانند که با ۵ دقیقه idle timeout قبلی، رم آن‌ها تا مدت‌ها آزاد نمی‌شد.
+            # - bufferSize=64 (کیلوبایت): اندازه بافر داخلی هر اتصال؛ این مقدار دقیقاً همان عددی است که
+            #   پروژه‌های مشابه Xray برای هزاران کاربر هم‌زمان روی سرورهای کم‌رم توصیه و تست کرده‌اند
+            #   (پیش‌فرض اگر ست نشود می‌تواند چند برابر این مقدار رم بگیرد).
+            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True,
+                              "handshake": 4, "connIdle": 60, "uplinkOnly": 2, "downlinkOnly": 4,
+                              "bufferSize": 64}},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True}
         },
         "api": {"tag": "api_service", "services": ["HandlerService", "LoggerService", "StatsService"]},
@@ -303,7 +397,9 @@ def sync_xray_config():
             try: xray_process.wait(timeout=2)
             except: xray_process.kill()
         if os.path.exists(XRAY_LOG): os.remove(XRAY_LOG)
-        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        xray_process = subprocess.Popen(["/usr/local/bin/xray", "-config", CFG_FILE],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         env=get_xray_env())
     except: pass
 
 async def stats_updater():
@@ -754,6 +850,8 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
         "ul_speed": stats.get("ul_speed", 0),
         "uptime": uptime_str(),
         "ram": sys_info["ram"],
+        "ram_used_mb": sys_info.get("ram_used_mb", 0),
+        "ram_limit_mb": sys_info.get("ram_limit_mb", 0),
         "cpu": sys_info["cpu"],
         "active_configs": active_configs,
         "railway_available": railway_metrics["available"],
@@ -1078,7 +1176,8 @@ async def subscription(sid: str, request: Request):
     remaining_days = max(0, int((expiry_time - time.time()) / 86400)) if expiry_time else 0
     status = user_info.get("status", "active")
     
-    html_template = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>پنل کاربری</title><link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet"><style>*{box-sizing:border-box;margin:0;padding:0;font-family:'Vazirmatn',sans-serif}body{background:#f0f4ff;color:#1e293b;display:flex;justify-content:center;padding:20px}.container{max-width:600px;width:100%}.header{text-align:center;margin-bottom:30px}.header h1{color:#6366f1;font-size:24px;margin-bottom:5px}.qr-box{background:#fff;padding:15px;border-radius:16px;box-shadow:0 2px 8px rgba(0,0,0,0.05);text-align:center;border:1px solid #e2e8f0;margin-bottom:30px}.qr-box img{width:200px;border-radius:12px}.stats-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;margin-bottom:30px}.stat-card{background:#fff;padding:20px;border-radius:16px;box-shadow:0 2px 8px rgba(0,0,0,0.05);text-align:center;border:1px solid #e2e8f0}.config-box{background:#fff;border-radius:12px;padding:15px;margin-bottom:12px;border:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;gap:10px;overflow:hidden}.config-info{flex:1;overflow:hidden}.config-title{font-size:13px;font-weight:600;color:#6366f1;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.config-link{font-size:10px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:left}.copy-btn{padding:8px 15px;background:#6366f1;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;white-space:nowrap}.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;margin-bottom:15px}.badge-active{background:#d1fae5;color:#065f46}.badge-expired{background:#fee2e2;color:#991b1b}</style></head><body><div class="container"><div class="header"><h1>⚡ پنل کاربری __LABEL__</h1><div class="badge __BADGE_CLASS__">__STATUS_TEXT__</div></div><div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=__SUB_LINK_URL__"></div><div class="stats-grid"><div class="stat-card"><div class="stat-icon">📦</div><div class="stat-val">__USED__</div><div class="stat-label">حجم مصرف شده</div></div><div class="stat-card"><div class="stat-icon">📊</div><div class="stat-val">__REMAIN__</div><div class="stat-label">حجم باقی‌مانده</div></div><div class="stat-card"><div class="stat-icon">📈</div><div class="stat-val">__TOTAL__</div><div class="stat-label">حجم کل</div></div><div class="stat-card"><div class="stat-icon">⏳</div><div class="stat-val">__DAYS__</div><div class="stat-label">روزهای باقی‌مانده</div></div></div><div id="configs"><div class="config-box"><div class="config-info"><div class="config-title">🔗 VLESS + WS + TLS</div><div class="config-link">__LINK_WS__</div></div><button class="copy-btn" onclick="copyText('__LINK_WS__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">⚡ VLESS + XHTTP + TLS</div><div class="config-link">__LINK_XHTTP__</div></div><button class="copy-btn" onclick="copyText('__LINK_XHTTP__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🚀 VLESS + gRPC + TLS</div><div class="config-link">__LINK_GRPC__</div></div><button class="copy-btn" onclick="copyText('__LINK_GRPC__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🛡️ VLESS + HTTPUpgrade + TLS</div><div class="config-link">__LINK_HU__</div></div><button class="copy-btn" onclick="copyText('__LINK_HU__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">👻 Trojan + WS + TLS</div><div class="config-link">__LINK_TROJAN__</div></div><button class="copy-btn" onclick="copyText('__LINK_TROJAN__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🌀 VMess + WS + TLS</div><div class="config-link">__LINK_VMESS__</div></div><button class="copy-btn" onclick="copyText('__LINK_VMESS__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🔥 VLESS + Reality + Vision</div><div class="config-link">__LINK_REALITY__</div></div><button class="copy-btn" onclick="copyText('__LINK_REALITY__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🛡️ VLESS + XHTTP + Reality</div><div class="config-link">__LINK_XHTTP_R__</div></div><button class="copy-btn" onclick="copyText('__LINK_XHTTP_R__', this)">کپی</button></div></div></div><script>function copyText(t,btn){navigator.clipboard.writeText(t).then(function(){var o=btn.textContent;btn.textContent='کپی شد ✓';btn.style.background='#10b981';setTimeout(function(){btn.textContent=o;btn.style.background='#6366f1'},2000)})}</script></body></html>"""
+    html_template = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>پنل کاربری</title><link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet"><style>*{box-sizing:border-box;margin:0;padding:0;font-family:'Vazirmatn',sans-serif}body{background:#f0f4ff;color:#1e293b;display:flex;justify-content:center;padding:20px}.container{max-width:600px;width:100%}.header{text-align:center;margin-bottom:30px}.header h1{color:#6366f1;font-size:24px;margin-bottom:5px}.qr-box{background:#fff;padding:15px;border-radius:16px;box-shadow:0 2px 8px rgba(0,0,0,0.05);text-align:center;border:1px solid #e2e8f0;margin-bottom:30px}.qr-box img{width:200px;border-radius:12px}.stats-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;margin-bottom:30px}.stat-card{background:#fff;padding:20px;border-radius:16px;box-shadow:0 2px 8px rgba(0,0,0,0.05);text-align:center;border:1px solid #e2e8f0}.config-box{background:#fff;border-radius:12px;padding:15px;margin-bottom:12px;border:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;gap:10px;overflow:hidden}.config-info{flex:1;overflow:hidden}.config-title{font-size:13px;font-weight:600;color:#6366f1;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.config-link{font-size:10px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:left}.copy-btn{padding:8px 15px;background:#6366f1;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;white-space:nowrap}.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;margin-bottom:15px}.badge-active{background:#d1fae5;color:#065f46}.badge-expired{background:#fee2e2;color:#991b1b}.sponsor-box{display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#eef2ff,#f5f3ff);border:1px solid #c7d2fe;border-radius:12px;padding:10px 14px;margin-bottom:18px;font-size:12px;color:#4338ca;text-decoration:none}.sponsor-box .sp-icon{font-size:18px}.sponsor-box .sp-text{flex:1;line-height:1.5}.sponsor-box .sp-text b{display:block;font-size:12.5px;color:#3730a3}.sponsor-box .sp-link{font-size:11px;color:#6366f1;direction:ltr;display:inline-block;font-weight:600}.copy-all-btn{display:block;width:100%;padding:11px;background:#10b981;color:#fff;border:none;border-radius:10px;cursor:pointer;font-size:13px;font-weight:700;margin-bottom:16px;font-family:'Vazirmatn',sans-serif}</style></head><body><div class="container"><div class="header"><h1>⚡ پنل کاربری __LABEL__</h1><div class="badge __BADGE_CLASS__">__STATUS_TEXT__</div></div><a class="sponsor-box" href="https://t.me/ZodProxy" target="_blank" rel="noopener"><span class="sp-icon">📡</span><span class="sp-text"><b>دریافت پروکسی و کانفیگ‌های پرسرعت</b><span class="sp-link">@ZodProxy ←</span></span></a><div class="qr-box"><img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=__SUB_LINK_URL__"></div><div class="stats-grid"><div class="stat-card"><div class="stat-icon">📦</div><div class="stat-val">__USED__</div><div class="stat-label">حجم مصرف شده</div></div><div class="stat-card"><div class="stat-icon">📊</div><div class="stat-val">__REMAIN__</div><div class="stat-label">حجم باقی‌مانده</div></div><div class="stat-card"><div class="stat-icon">📈</div><div class="stat-val">__TOTAL__</div><div class="stat-label">حجم کل</div></div><div class="stat-card"><div class="stat-icon">⏳</div><div class="stat-val">__DAYS__</div><div class="stat-label">روزهای باقی‌مانده</div></div></div><button class="copy-all-btn" id="copy-all-btn" onclick="copyAllConfigs(this)">📋 کپی همه کانفیگ‌ها</button><div id="configs"><div class="config-box"><div class="config-info"><div class="config-title">🔗 VLESS + WS + TLS</div><div class="config-link">__LINK_WS__</div></div><button class="copy-btn" onclick="copyText('__LINK_WS__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">⚡ VLESS + XHTTP + TLS</div><div class="config-link">__LINK_XHTTP__</div></div><button class="copy-btn" onclick="copyText('__LINK_XHTTP__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🚀 VLESS + gRPC + TLS</div><div class="config-link">__LINK_GRPC__</div></div><button class="copy-btn" onclick="copyText('__LINK_GRPC__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🛡️ VLESS + HTTPUpgrade + TLS</div><div class="config-link">__LINK_HU__</div></div><button class="copy-btn" onclick="copyText('__LINK_HU__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">👻 Trojan + WS + TLS</div><div class="config-link">__LINK_TROJAN__</div></div><button class="copy-btn" onclick="copyText('__LINK_TROJAN__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🌀 VMess + WS + TLS</div><div class="config-link">__LINK_VMESS__</div></div><button class="copy-btn" onclick="copyText('__LINK_VMESS__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🔥 VLESS + Reality + Vision</div><div class="config-link">__LINK_REALITY__</div></div><button class="copy-btn" onclick="copyText('__LINK_REALITY__', this)">کپی</button></div><div class="config-box"><div class="config-info"><div class="config-title">🛡️ VLESS + XHTTP + Reality</div><div class="config-link">__LINK_XHTTP_R__</div></div><button class="copy-btn" onclick="copyText('__LINK_XHTTP_R__', this)">کپی</button></div></div></div><script>function copyText(t,btn){navigator.clipboard.writeText(t).then(function(){var o=btn.textContent;btn.textContent='کپی شد ✓';btn.style.background='#10b981';setTimeout(function(){btn.textContent=o;btn.style.background='#6366f1'},2000)})}
+function copyAllConfigs(btn){var all=["__LINK_WS__","__LINK_XHTTP__","__LINK_GRPC__","__LINK_HU__","__LINK_TROJAN__","__LINK_VMESS__","__LINK_REALITY__","__LINK_XHTTP_R__"].join("\n");navigator.clipboard.writeText(all).then(function(){var o=btn.textContent;btn.textContent='✅ همه کانفیگ‌ها کپی شدند';setTimeout(function(){btn.textContent=o},2000)})}</script></body></html>"""
 
     import urllib.parse
     html_content = html_template.replace("__LABEL__", user_info['label']) \
@@ -1123,7 +1222,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
     <div class="stat-card"><div class="stat-icon">🧮</div><div class="stat-val" id="s-total-combined">—</div><div class="stat-label">ترافیک کل (Xray + ریلوی)</div></div>
     <div class="stat-card speed-dl"><div class="stat-icon">⬇️</div><div class="stat-val" id="s-dl">—</div><div class="stat-label">سرعت دانلود</div></div>
     <div class="stat-card speed-ul"><div class="stat-icon">⬆️</div><div class="stat-val" id="s-ul">—</div><div class="stat-label">سرعت آپلود</div></div>
-    <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-ram">—</div><div class="stat-label">رم مصرفی (%)</div></div>
+    <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-ram">—</div><div class="stat-label">رم مصرفی کانتینر (%)</div><div id="s-ram-detail" style="font-size:11px;color:var(--muted);margin-top:2px">—</div></div>
     <div class="stat-card"><div class="stat-icon">⚙️</div><div class="stat-val" id="s-cpu">—</div><div class="stat-label">پردازنده (%)</div></div>
     <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-railway-ram">—</div><div class="stat-label">رم ریلوی (%)</div></div>
     <div class="stat-card"><div class="stat-icon">💾</div><div class="stat-val" id="s-railway-disk">—</div><div class="stat-label">دیسک کانتینر</div></div>
@@ -1161,6 +1260,7 @@ document.getElementById('s-bytes').textContent=fmtBytes(d.bytes);
 document.getElementById('s-dl').textContent=fmtSpeed(d.dl_speed);
 document.getElementById('s-ul').textContent=fmtSpeed(d.ul_speed);
 document.getElementById('s-ram').textContent=d.ram+'%';
+document.getElementById('s-ram-detail').textContent=d.ram_used_mb+' / '+d.ram_limit_mb+' MB';
 document.getElementById('s-cpu').textContent=d.cpu+'%';
 document.getElementById('s-total-combined').textContent=fmtBytes(d.combined_bytes);
 document.getElementById('s-railway-disk').textContent=d.disk_used_gb+' / '+d.disk_total_gb+' GB ('+d.disk_pct+'%)';
