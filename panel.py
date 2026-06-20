@@ -1,7 +1,7 @@
 """
 پنل مدیریت XRAY — Ultimate Edition + CPU/RAM Optimized
 """
-import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64, ipaddress
+import os, json, uuid, asyncio, hashlib, secrets, time, subprocess, re, base64, ipaddress, shutil
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Optional
@@ -55,7 +55,7 @@ SESSIONS = {}
 LINKS = {}
 error_log = deque(maxlen=50)
 stats = {"bytes": 0, "bytes_prev": 0, "bytes_prev_time": time.time(), "dl_speed": 0, "ul_speed": 0, "start": time.time()}
-sys_info = {"ram": 0, "cpu": 0}
+sys_info = {"ram": 0, "cpu": 0, "disk_used_gb": 0, "disk_total_gb": 0, "disk_pct": 0}
 prev_cpu = None
 xray_process = None
 xray_log_pos = 0
@@ -71,7 +71,8 @@ reality_keys = {"priv": "", "pub": ""}
 # کش متریک‌های ریلوی؛ هر ۶۰ ثانیه یک‌بار آپدیت می‌شود (سبک، تا فشاری به رم/CPU وارد نشود)
 railway_metrics = {"available": False, "ram_pct": 0, "mem_used_gb": 0, "mem_limit_gb": 0,
                     "net_bytes": 0, "net_rx_gb": 0, "net_tx_gb": 0,
-                    "disk_used_gb": 0, "disk_limit_gb": 0, "disk_pct": 0, "updated": 0}
+                    "disk_used_gb": 0, "disk_limit_gb": 0, "disk_pct": 0, "updated": 0,
+                    "net_rx_total_gb": 0, "net_tx_total_gb": 0, "net_rx_last_ts": 0, "net_tx_last_ts": 0}
 
 RATE_LIMITS = {}
 tg_client = None
@@ -163,6 +164,17 @@ def get_sys_info():
                 delta_total = total - prev_total
                 if delta_total > 0: sys_info["cpu"] = max(0, int(100 - (100 * delta_idle / delta_total)))
                 prev_cpu = (idle, total)
+
+        # دیسک: مستقیماً از خود فایل‌سیستم کانتینر خوانده می‌شود (نه از API ریلوی).
+        # دلیل: API متریک ریلوی برای این نوع سرویس مقدار EPHEMERAL_DISK_USAGE_GB را اصلاً برنمی‌گرداند
+        # و DISK_USAGE_GB (که مخصوص Volume جداست) همیشه صفر است چون Volume‌ای وصل نیست.
+        # این روش محلی همیشه دقیق و واقعی است و به هیچ توکنی نیاز ندارد.
+        try:
+            du = shutil.disk_usage("/")
+            sys_info["disk_total_gb"] = round(du.total / (1024 ** 3), 2)
+            sys_info["disk_used_gb"] = round(du.used / (1024 ** 3), 2)
+            sys_info["disk_pct"] = round(du.used / du.total * 100, 1) if du.total else 0
+        except: pass
     except: pass
 
 # ── Xray Core Manager ────────────────────────────────────
@@ -183,6 +195,11 @@ def load_data():
                 if "reality_priv" in data:
                     reality_keys["priv"] = data["reality_priv"]
                     reality_keys["pub"] = data["reality_pub"]
+                if "railway_net_rx_total_gb" in data:
+                    railway_metrics["net_rx_total_gb"] = data.get("railway_net_rx_total_gb", 0)
+                    railway_metrics["net_tx_total_gb"] = data.get("railway_net_tx_total_gb", 0)
+                    railway_metrics["net_rx_last_ts"] = data.get("railway_net_rx_last_ts", 0)
+                    railway_metrics["net_tx_last_ts"] = data.get("railway_net_tx_last_ts", 0)
     except: pass
 
     updated = False
@@ -199,7 +216,11 @@ def save_stats():
     with open(STATS_FILE, "w") as f:
         json.dump({
             "total_unique_ips": list(total_unique_ips), "bytes": stats["bytes"], "start": stats["start"],
-            "user_traffic": user_traffic, "reality_priv": reality_keys["priv"], "reality_pub": reality_keys["pub"]
+            "user_traffic": user_traffic, "reality_priv": reality_keys["priv"], "reality_pub": reality_keys["pub"],
+            "railway_net_rx_total_gb": railway_metrics.get("net_rx_total_gb", 0),
+            "railway_net_tx_total_gb": railway_metrics.get("net_tx_total_gb", 0),
+            "railway_net_rx_last_ts": railway_metrics.get("net_rx_last_ts", 0),
+            "railway_net_tx_last_ts": railway_metrics.get("net_tx_last_ts", 0),
         }, f)
 
 def generate_reality_keys():
@@ -467,8 +488,10 @@ async def fetch_railway_metrics():
         """
         variables = {
             # نکته: enum واقعی ریلوی "DISK_LIMIT_GB" ندارد (طبق introspection زنده) — همان چیزی که باعث
-            # خطای 400 می‌شد. دیسک محدودیت ثابتی روی ریلوی ندارد، فقط مقدار مصرفی (Ephemeral/Volume) دارد.
-            "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB", "EPHEMERAL_DISK_USAGE_GB", "DISK_USAGE_GB"],
+            # خطای 400 می‌شد. دیسک هم اصلاً اینجا درخواست نمی‌شود چون EPHEMERAL_DISK_USAGE_GB برای این
+            # سرویس داده‌ای برنمی‌گرداند و DISK_USAGE_GB (مخصوص Volume) همیشه صفر است؛ دیسک واقعی را
+            # مستقیماً و محلی از خود کانتینر می‌خوانیم (تابع get_sys_info)، نه از این API.
+            "measurements": ["MEMORY_USAGE_GB", "MEMORY_LIMIT_GB", "NETWORK_RX_GB", "NETWORK_TX_GB"],
             "startDate": start.isoformat() + "Z",
             "endDate": now.isoformat() + "Z",
             "environmentId": RAILWAY_ENVIRONMENT_ID,
@@ -486,29 +509,40 @@ async def fetch_railway_metrics():
             railway_metrics["available"] = False
             return
 
-        latest = {}
-        for item in (data.get("data", {}) or {}).get("metrics", []) or []:
-            vals = item.get("values") or []
-            if vals:
-                latest[item["measurement"]] = vals[-1]["value"]
+        results = {item["measurement"]: (item.get("values") or []) for item in (data.get("data", {}) or {}).get("metrics", []) or []}
 
-        mem_used = latest.get("MEMORY_USAGE_GB", 0) or 0
-        mem_limit = latest.get("MEMORY_LIMIT_GB", 0) or 0
-        net_rx = latest.get("NETWORK_RX_GB", 0) or 0
-        net_tx = latest.get("NETWORK_TX_GB", 0) or 0
-        # دیسک: اول مصرف Ephemeral (فضای کانتینر، چیزی که معمولاً پر می‌شود) را در نظر می‌گیریم؛
-        # اگر صفر بود یعنی شاید یک Volume جدا وصل است، آن مقدار را نشان می‌دهیم. ریلوی برای هیچ‌کدام
-        # عدد "سقف" مشخصی برنمی‌گرداند، پس فقط مقدار مصرفی (GB) نشان داده می‌شود نه درصد.
-        disk_used = latest.get("EPHEMERAL_DISK_USAGE_GB", 0) or latest.get("DISK_USAGE_GB", 0) or 0
+        # رم: یک gauge لحظه‌ای است؛ فقط آخرین مقدار کافی است.
+        mem_vals = results.get("MEMORY_USAGE_GB", [])
+        lim_vals = results.get("MEMORY_LIMIT_GB", [])
+        mem_used = mem_vals[-1]["value"] if mem_vals else 0
+        mem_limit = lim_vals[-1]["value"] if lim_vals else 0
+
+        # ترافیک: ریلوی برای هر بازه (~۶۰ ثانیه) مقدار مصرفی همان بازه را برمی‌گرداند، نه یک عدد تجمعی!
+        # (مقادیر بالا و پایین می‌روند، نشانه‌ی delta بودن نه cumulative). پس برای «ترافیک کل» باید
+        # هر بار فقط بازه‌های جدید (ts بزرگ‌تر از آخرین ts دیده‌شده) را به یک شمارنده‌ی دائمی اضافه کنیم.
+        def accumulate(values, total_key, ts_key):
+            last_ts = railway_metrics.get(ts_key, 0)
+            new_total = railway_metrics.get(total_key, 0)
+            max_ts = last_ts
+            for v in sorted(values, key=lambda x: x.get("ts", 0)):
+                ts = v.get("ts", 0)
+                if ts > last_ts:
+                    new_total += (v.get("value") or 0)
+                    if ts > max_ts: max_ts = ts
+            railway_metrics[total_key] = new_total
+            railway_metrics[ts_key] = max_ts
+            return new_total
+
+        net_rx_total = accumulate(results.get("NETWORK_RX_GB", []), "net_rx_total_gb", "net_rx_last_ts")
+        net_tx_total = accumulate(results.get("NETWORK_TX_GB", []), "net_tx_total_gb", "net_tx_last_ts")
+        save_stats()  # ذخیره شمارنده‌های تجمعی ترافیک ریلوی تا بین ری‌استارت‌ها از دست نروند
 
         railway_metrics.update({
             "available": True,
             "ram_pct": round(mem_used / mem_limit * 100, 1) if mem_limit else 0,
             "mem_used_gb": round(mem_used, 2), "mem_limit_gb": round(mem_limit, 2),
-            "net_rx_gb": round(net_rx, 3), "net_tx_gb": round(net_tx, 3),
-            "net_bytes": int((net_rx + net_tx) * (1024 ** 3)),
-            "disk_used_gb": round(disk_used, 2), "disk_limit_gb": 0,
-            "disk_pct": 0,
+            "net_rx_gb": round(net_rx_total, 3), "net_tx_gb": round(net_tx_total, 3),
+            "net_bytes": int((net_rx_total + net_tx_total) * (1024 ** 3)),
             "updated": time.time(),
         })
     except Exception as e:
@@ -725,9 +759,9 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
         "railway_available": railway_metrics["available"],
         "railway_ram_pct": railway_metrics["ram_pct"],
         "railway_net_bytes": railway_metrics["net_bytes"],
-        "railway_disk_used_gb": railway_metrics["disk_used_gb"],
-        "railway_disk_limit_gb": railway_metrics["disk_limit_gb"],
-        "railway_disk_pct": railway_metrics["disk_pct"],
+        "disk_used_gb": sys_info["disk_used_gb"],
+        "disk_total_gb": sys_info["disk_total_gb"],
+        "disk_pct": sys_info["disk_pct"],
         "combined_bytes": stats["bytes"] + railway_metrics["net_bytes"],
     }
 
@@ -1092,7 +1126,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
     <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-ram">—</div><div class="stat-label">رم مصرفی (%)</div></div>
     <div class="stat-card"><div class="stat-icon">⚙️</div><div class="stat-val" id="s-cpu">—</div><div class="stat-label">پردازنده (%)</div></div>
     <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-railway-ram">—</div><div class="stat-label">رم ریلوی (%)</div></div>
-    <div class="stat-card"><div class="stat-icon">💾</div><div class="stat-val" id="s-railway-disk">—</div><div class="stat-label">دیسک ریلوی</div></div>
+    <div class="stat-card"><div class="stat-icon">💾</div><div class="stat-val" id="s-railway-disk">—</div><div class="stat-label">دیسک کانتینر</div></div>
   </div>
 
   <!-- باکس کانفیگ‌های فعال -->
@@ -1129,14 +1163,13 @@ document.getElementById('s-ul').textContent=fmtSpeed(d.ul_speed);
 document.getElementById('s-ram').textContent=d.ram+'%';
 document.getElementById('s-cpu').textContent=d.cpu+'%';
 document.getElementById('s-total-combined').textContent=fmtBytes(d.combined_bytes);
+document.getElementById('s-railway-disk').textContent=d.disk_used_gb+' / '+d.disk_total_gb+' GB ('+d.disk_pct+'%)';
 if(d.railway_available){
 document.getElementById('s-railway-traffic').textContent=fmtBytes(d.railway_net_bytes);
 document.getElementById('s-railway-ram').textContent=d.railway_ram_pct+'%';
-document.getElementById('s-railway-disk').textContent=d.railway_disk_limit_gb?(d.railway_disk_used_gb+' / '+d.railway_disk_limit_gb+' GB'):(d.railway_disk_used_gb+' GB');
 }else{
 document.getElementById('s-railway-traffic').textContent='غیرفعال';
 document.getElementById('s-railway-ram').textContent='غیرفعال';
-document.getElementById('s-railway-disk').textContent='غیرفعال';
 }
 
 // نمایش کانفیگ‌های فعال (هر پروتکلی که الان کسی واقعا به آن وصل است)
