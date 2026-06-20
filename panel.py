@@ -741,6 +741,62 @@ async def api_logs(token: Optional[str] = Cookie(None)):
             logs.append(f"[{e['t']}] {e['e']}")
     return {"logs": logs}
 
+def _gql_type_str(t):
+    """تبدیل ساختار تایپ introspection گرافیک‌کیوال به یک رشته خوانا مثل [MetricMeasurement!]!"""
+    if not t: return None
+    kind = t.get("kind")
+    if kind == "NON_NULL": return (_gql_type_str(t.get("ofType")) or "?") + "!"
+    if kind == "LIST": return "[" + (_gql_type_str(t.get("ofType")) or "?") + "]"
+    return t.get("name")
+
+async def railway_introspect():
+    """
+    وقتی کوئری metrics خطا می‌دهد، به‌جای حدس‌زدن دوباره، مستقیم از خود اسکیمای گرافیک‌کیوال ریلوی
+    می‌پرسیم: اسم دقیق فیلد متریک‌ها چیست، چه آرگومان‌هایی می‌گیرد، و مقادیر مجاز enum اندازه‌گیری‌ها
+    (MetricMeasurement) و گروه‌بندی (MetricTag) چیست. این خودِ اسکیمای زنده ریلویه، نه حدس.
+    """
+    introspect_query = """
+    query Introspect {
+      __schema {
+        queryType {
+          fields {
+            name
+            args {
+              name
+              type { ...T }
+            }
+          }
+        }
+      }
+      measurementEnum: __type(name: "MetricMeasurement") { name enumValues { name } }
+      tagEnum: __type(name: "MetricTag") { name enumValues { name } }
+    }
+    fragment T on __Type {
+      kind name
+      ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+    }
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            RAILWAY_GRAPHQL_URL, json={"query": introspect_query},
+            headers={"Authorization": f"Bearer {RAILWAY_API_TOKEN}", "Content-Type": "application/json"},
+        )
+    body = resp.json()
+    if "errors" in body:
+        return {"introspection_error": body["errors"]}
+    data = body.get("data") or {}
+    fields = ((data.get("__schema") or {}).get("queryType") or {}).get("fields") or []
+    metric_fields = []
+    for f in fields:
+        if "metric" in (f.get("name") or "").lower():
+            args = [{"name": a["name"], "type": _gql_type_str(a.get("type"))} for a in (f.get("args") or [])]
+            metric_fields.append({"name": f["name"], "args": args})
+    return {
+        "metric_query_fields": metric_fields,
+        "MetricMeasurement_values": [v["name"] for v in (data.get("measurementEnum") or {}).get("enumValues", []) or []],
+        "MetricTag_values": [v["name"] for v in (data.get("tagEnum") or {}).get("enumValues", []) or []],
+    }
+
 @app.get("/api/railway-test")
 async def railway_test(token: Optional[str] = Cookie(None)):
     """یک تست زنده و فوری (بدون کش) برای دیباگ اتصال به API ریلوی؛ خطای دقیق را برمی‌گرداند."""
@@ -794,8 +850,12 @@ async def railway_test(token: Optional[str] = Cookie(None)):
             out["raw_body"] = resp.text[:800]
             return out
         if "errors" in body:
-            out["result"] = "ریلوی خطا برگرداند (پیام دقیق را برای من بفرست تا اصلاح کنم)."
+            out["result"] = "ریلوی خطا برگرداند؛ برای پیداکردن اسم درست فیلدها از خود اسکیمای ریلوی introspection گرفتم (پایین را ببین) — این خروجی کامل را برام بفرست."
             out["graphql_errors"] = body["errors"]
+            try:
+                out["schema_introspection"] = await railway_introspect()
+            except Exception as e:
+                out["schema_introspection_error"] = str(e)
             return out
         metrics = (body.get("data") or {}).get("metrics") or []
         out["result"] = "موفق ✓" if metrics else "اتصال موفق بود اما هیچ متریکی برنگشت (ممکن است بازه زمانی داده نداشته باشد یا اشتراک ریلوی این داده را ندهد)."
@@ -1038,7 +1098,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
 
 <div class="page" id="page-users"><div class="page-title">کاربران</div><div class="card"><div class="card-header"><h3>لیست کاربران</h3><button class="btn-add" onclick="openAdd()">+ کاربر جدید</button></div><table><thead><tr><th>نام</th><th>UUID</th><th>تاریخ</th><th>حجم</th><th>وضعیت</th><th>عملیات</th></tr></thead><tbody id="users-tbody"></tbody></table></div></div>
 <div class="page" id="page-logs"><div class="page-title">لاگ‌های سیستم</div><div class="card"><div class="card-header"><h3>آخرین خطاهای Xray</h3><button class="btn-sm" onclick="loadLogs()">🔄 بروزرسانی</button></div><div class="log-box" id="log-box">در حال بارگذاری...</div></div></div>
-<div class="page" id="page-settings"><div class="page-title">تنظیمات</div><div class="settings-card"><h3>تغییر رمز عبور</h3><div class="form-group"><label>رمز فعلی</label><input type="password" id="cp-old"></div><div class="form-group"><label>رمز جدید</label><input type="password" id="cp-new"></div><button class="btn-confirm" onclick="changePass()" style="width:100%;padding:11px">تغییر رمز عبور</button><div id="cp-msg" style="margin-top:10px;font-size:13px;text-align:center"></div></div><div class="settings-card"><h3>بکاپ‌گیری و بازیابی</h3><button class="btn-confirm" onclick="downloadBackup()" style="width:100%; margin-bottom:10px">⬇️ دانلود بکاپ</button><input type="file" id="restore-file" accept=".json" style="display:none"><button class="btn-confirm" onclick="document.getElementById('restore-file').click()" style="width:100%; background:var(--muted)">⬆️ آپلود و بازیابی</button></div><div class="settings-card"><h3>پاکسازی کاربران منقضی شده</h3><button class="btn-confirm" onclick="cleanupUsers()" style="width:100%; background:var(--red)">🗑️ حذف کاربران منقضی شده</button></div><div class="settings-card"><h3>تست اتصال به API ریلوی</h3><p style="font-size:12px;color:var(--muted);margin-bottom:10px">برای دیباگ باکس‌های رم/ترافیک/دیسک ریلوی در داشبورد. اگر RAILWAY_API_TOKEN را تازه ست کرده‌اید، اول باید سرویس را Redeploy کنید تا متغیر جدید لود شود.</p><button class="btn-confirm" onclick="testRailway()" style="width:100%">🚂 تست اتصال</button><pre id="railway-test-result" style="margin-top:10px;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-all;display:none"></pre></div></div>
+<div class="page" id="page-settings"><div class="page-title">تنظیمات</div><div class="settings-card"><h3>تغییر رمز عبور</h3><div class="form-group"><label>رمز فعلی</label><input type="password" id="cp-old"></div><div class="form-group"><label>رمز جدید</label><input type="password" id="cp-new"></div><button class="btn-confirm" onclick="changePass()" style="width:100%;padding:11px">تغییر رمز عبور</button><div id="cp-msg" style="margin-top:10px;font-size:13px;text-align:center"></div></div><div class="settings-card"><h3>بکاپ‌گیری و بازیابی</h3><button class="btn-confirm" onclick="downloadBackup()" style="width:100%; margin-bottom:10px">⬇️ دانلود بکاپ</button><input type="file" id="restore-file" accept=".json" style="display:none"><button class="btn-confirm" onclick="document.getElementById('restore-file').click()" style="width:100%; background:var(--muted)">⬆️ آپلود و بازیابی</button></div><div class="settings-card"><h3>پاکسازی کاربران منقضی شده</h3><button class="btn-confirm" onclick="cleanupUsers()" style="width:100%; background:var(--red)">🗑️ حذف کاربران منقضی شده</button></div><div class="settings-card"><h3>تست اتصال به API ریلوی</h3><p style="font-size:12px;color:var(--muted);margin-bottom:10px">برای دیباگ باکس‌های رم/ترافیک/دیسک ریلوی در داشبورد. اگر RAILWAY_API_TOKEN را تازه ست کرده‌اید، اول باید سرویس را Redeploy کنید تا متغیر جدید لود شود.</p><button class="btn-confirm" onclick="testRailway()" style="width:100%">🚂 تست اتصال</button><pre id="railway-test-result" style="margin-top:10px;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-all;display:none;max-height:400px;overflow-y:auto"></pre></div></div>
 </div>
 
 <div class="overlay" id="add-modal"><div class="modal"><h3>کاربر جدید</h3><div class="form-group"><label>نام کاربر</label><input id="new-label" placeholder="مثلاً: علی"></div><div class="form-group"><label>UUID (اختیاری)</label><input id="new-uuid" placeholder="خالی بگذارید برای ساخت خودکار"></div><div class="form-group"><label>کد ساب لینک ۷ رقمی (اختیاری)</label><input id="new-shortid" placeholder="خالی بگذارید برای ساخت خودکار" maxlength="7"></div><div class="form-group"><label>SNI سفارشی برای Reality (اختیاری)</label><input id="new-sni" value="yahoo.com"></div><div class="form-group"><label>ایپی تمیز برای ۶ کانفیگ اول (اختیاری)</label><input id="new-cleanip" placeholder="مثلاً: 1.1.1.1"></div><div style="display:flex;gap:10px"><div class="form-group" style="flex:1"><label>انقضا (روز)</label><input type="number" id="new-days" value="0" placeholder="0 = نامحدود"></div><div class="form-group" style="flex:1"><label>محدودیت حجم (GB)</label><input type="number" id="new-gb" value="0" placeholder="0 = نامحدود"></div><div class="form-group" style="flex:1"><label>محدودیت دستگاه</label><input type="number" id="new-iplimit" value="0" placeholder="0 = نامحدود"></div></div><div class="modal-footer"><button class="btn-sm" onclick="closeAdd()">انصراف</button><button class="btn-confirm" onclick="createUser()">ساخت کاربر</button></div></div></div>
