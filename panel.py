@@ -1369,67 +1369,6 @@ if __name__ == "__main__":
 
 from fastapi.responses import HTMLResponse
 
-@app.get("/dashboard")
-def dashboard():
-    html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>XRAY Dashboard</title>
-    <style>
-        body { background:#0b1220; color:#e5e7eb; font-family:Arial; padding:20px; }
-        .card { background:#111827; padding:15px; margin:10px 0; border-radius:12px; }
-        .bar { width:100%; height:10px; background:#374151; border-radius:6px; overflow:hidden; }
-        .fill { height:100%; background:#22c55e; width:0%; }
-        .blue { background:#3b82f6; }
-        .red { background:#ef4444; }
-        h1 { font-size:20px; }
-    </style>
-</head>
-<body>
-
-<h1>⚡ XRAY Live Dashboard (Optimized)</h1>
-
-<div class="card">
-CPU Usage
-<div class="bar"><div id="cpu" class="fill"></div></div>
-</div>
-
-<div class="card">
-RAM Usage
-<div class="bar"><div id="ram" class="fill blue"></div></div>
-</div>
-
-<div class="card">
-Disk Usage
-<div class="bar"><div id="disk" class="fill red"></div></div>
-</div>
-
-<div class="card">
-Active Users: <span id="users">0</span>
-</div>
-
-<script>
-async function load(){
-    let r = await fetch('/api/ui-stats');
-    let d = await r.json();
-
-    document.getElementById('cpu').style.width = d.cpu + "%";
-    document.getElementById('ram').style.width = d.ram + "%";
-    document.getElementById('disk').style.width = d.disk + "%";
-    document.getElementById('users').innerText = d.active;
-}
-
-setInterval(load, 2000);
-load();
-</script>
-
-</body>
-</html>
-    """
-    return HTMLResponse(html)
-
-
 @app.get("/api/ui-stats")
 def ui_stats():
     try:
