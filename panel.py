@@ -65,6 +65,7 @@ user_last_active = {}
 active_connections = {}    # uid -> {ip: last_seen}   فقط Reality (ایپی واقعی مستقیم از Xray)
 protocol_connections = {}  # protocol -> {ip: last_seen}  بهترین تخمین ایپی واقعی هر پروتکل از لاگ Nginx
 inbound_last_active = {}   # tag -> last_seen   آیا همین الان ترافیک از این inbound رد شده (مستقل از تشخیص ایپی)
+user_protocol_active = {}  # uid -> {protocol: last_seen}  کدام کاربر به کدام پروتکل وصل است (از لاگ Xray)
 total_unique_ips = set()
 reality_keys = {"priv": "", "pub": ""}
 # کش متریک‌های ریلوی؛ هر ۶۰ ثانیه یک‌بار آپدیت می‌شود (سبک، تا فشاری به رم/CPU وارد نشود)
@@ -346,9 +347,11 @@ async def stats_updater():
                         protocol_connections[proto][real_ip] = now_t1
         except: pass
 
-        # ۳. خواندن IPهای Reality از لاگ Xray
-        # فقط اتصالاتی که IP آنها 127.0.0.1 نیست = Reality مستقیم
-        # WS/XHTTP/gRPC از طریق Nginx می‌آیند → همیشه 127.0.0.1 هستند → نادیده گرفته می‌شوند
+        # ۳. خواندن اتصالات از لاگ Xray (همه پروتکل‌ها)
+        # لاگ Xray شامل تگ inbound و ایمیل (UUID) هر اتصال است.
+        # از این اطلاعات دقیقاً می‌فهمیم کدام کاربر به کدام پروتکل وصل است.
+        # برای Reality ایپی واقعی هم استخراج می‌شود (چون مستقیم به Xray وصل می‌شود).
+        # برای WS/XHTTP/gRPC/... ایپی 127.0.0.1 است (چون از Nginx رد شده) — ایپی واقعی از لاگ Nginx خوانده می‌شود.
         try:
             if os.path.exists(XRAY_LOG):
                 if os.path.getsize(XRAY_LOG) > 5 * 1024 * 1024:
@@ -359,23 +362,25 @@ async def stats_updater():
                     f.seek(xray_log_pos); new_data = f.read(); xray_log_pos = f.tell()
 
                 now_t = time.time()
-                # فرمت لاگ Xray (نسخه‌های جدید): "... from tcp:IP:PORT accepted ... [tag -> tag] email: UUID"
-                # نسخه‌های قدیمی‌تر: "... from IP:PORT accepted ... email: UUID" (بدون tcp: و بدون [tag])
-                # هر دو حالت با regex زیر پشتیبانی می‌شوند، و مهم‌تر از همه: حالا دقیقاً تگ inbound را هم
-                # می‌خوانیم تا فقط اتصالات واقعی reality-in به‌عنوان Reality حساب شوند (نه هر چیز دیگری
-                # که به اشتباه با ایپی غیر-لوکال در لاگ ظاهر شود، مثل اتصالات fallback روی پورت Reality).
                 for m in XRAY_RE.finditer(new_data):
                     ip, tag, uid = m.group(1), m.group(2), m.group(3)
-                    if tag != "reality-in": continue
-                    # فقط Reality: ایپی واقعی کاربر (نه 127.0.0.1 و نه ایپی‌های داخلی/CGNAT مثل 100.64.x.x)
-                    if not is_public_ip(ip): continue
                     if uid not in LINKS: continue
-                    if uid not in active_connections:
-                        active_connections[uid] = {}
-                    active_connections[uid][ip] = now_t
+                    proto = TAG_TO_PROTO.get(tag)
+                    if not proto: continue
+
+                    # ردیابی دقیق: کدام کاربر به کدام پروتکل وصل است
+                    if uid not in user_protocol_active:
+                        user_protocol_active[uid] = {}
+                    user_protocol_active[uid][proto] = now_t
                     user_last_active[uid] = now_t
-                    if len(total_unique_ips) < 2000:
-                        total_unique_ips.add(ip)
+
+                    # فقط برای Reality: ایپی واقعی کاربر را هم ذخیره کن
+                    if tag == "reality-in" and is_public_ip(ip):
+                        if uid not in active_connections:
+                            active_connections[uid] = {}
+                        active_connections[uid][ip] = now_t
+                        if len(total_unique_ips) < 2000:
+                            total_unique_ips.add(ip)
         except: pass
 
         # ۴. پاکسازی حافظه
@@ -390,6 +395,14 @@ async def stats_updater():
             for ip in list(protocol_connections[proto].keys()):
                 if now - protocol_connections[proto][ip] > 60: del protocol_connections[proto][ip]
             if not protocol_connections[proto]: del protocol_connections[proto]
+        # پاکسازی ردیابی کاربر-پروتکل (۶۰ ثانیه بعد از آخرین فعالیت)
+        for uid in list(user_protocol_active.keys()):
+            for proto in list(user_protocol_active[uid].keys()):
+                if now - user_protocol_active[uid][proto] > 60: del user_protocol_active[uid][proto]
+            if not user_protocol_active[uid]: del user_protocol_active[uid]
+        # پاکسازی inbound_last_active (۶۰ ثانیه بعد از آخرین ترافیک)
+        for tag in list(inbound_last_active.keys()):
+            if now - inbound_last_active[tag] > 60: del inbound_last_active[tag]
             
         for t in list(SESSIONS.keys()):
             if now > SESSIONS.get(t, 0): del SESSIONS[t]
@@ -602,34 +615,42 @@ def fmt_speed(bps):
 def build_active_configs():
     """
     لیست کانفیگ‌های آنلاین را می‌سازد.
-    برای Reality دقیقاً می‌دانیم کدام کاربر با چه ایپی‌هایی وصل است (مستقیم از لاگ Xray).
-    برای WS/XHTTP/gRPC/HTTPUpgrade/Trojan/VMess (که پشت Nginx هستند)، "آنلاین بودن" را از
-    شمارنده ترافیک خود inbound در Xray می‌فهمیم (inbound_last_active) که کاملاً مستقل از اینکه
-    Nginx/هاست ایپی واقعی کاربر را نشان بدهد یا نه کار می‌کند. تعداد ایپی را اگر از لاگ Nginx
-    داشته باشیم دقیق نشان می‌دهیم، وگرنه تعداد کاربران آنلاین همان لحظه را به‌عنوان تخمین می‌گذاریم.
+    از user_protocol_active استفاده می‌کند که دقیقاً مشخص می‌کند کدام کاربر به کدام پروتکل وصل است.
+    این اطلاعات مستقیماً از لاگ Xray (تگ inbound + ایمیل کاربر) استخراج شده و ۱۰۰٪ دقیق است.
     """
     items = []
-    reality_uids = set()
-    for uid, ips in active_connections.items():
-        if uid not in LINKS or not ips: continue
-        label = LINKS[uid].get("label", uid[:8])
-        items.append({"config": "VLESS + Reality + Vision", "label": label, "ip_count": len(ips), "attributed": True})
-        reality_uids.add(uid)
-
-    other_online = [uid for uid in user_last_active if uid in LINKS and uid not in reality_uids]
-    other_labels = [LINKS[uid].get("label", uid[:8]) for uid in other_online]
-
     now = time.time()
-    active_protocols = [proto for tag, proto in TAG_TO_PROTO.items() if now - inbound_last_active.get(tag, 0) < 30]
 
-    for proto in active_protocols:
-        if not other_online: continue
-        label = PROTOCOL_LABELS.get(proto, proto)
-        ip_count = len(protocol_connections.get(proto, {})) or len(other_online)
-        if len(other_online) == 1:
-            items.append({"config": label, "label": other_labels[0], "ip_count": ip_count, "attributed": True})
+    # ساخت نگاشت پروتکل -> لیست کاربران از روی user_protocol_active
+    proto_users = {}  # protocol -> [{"uid": ..., "label": ...}]
+    for uid, protos in user_protocol_active.items():
+        if uid not in LINKS: continue
+        label = LINKS[uid].get("label", uid[:8])
+        for proto, last_seen in protos.items():
+            if now - last_seen > 60: continue
+            if proto not in proto_users:
+                proto_users[proto] = []
+            proto_users[proto].append({"uid": uid, "label": label})
+
+    for proto, users in proto_users.items():
+        if not users: continue
+        config_label = PROTOCOL_LABELS.get(proto, proto)
+
+        if proto == "reality":
+            # برای Reality: هر کاربر جداگانه با تعداد ایپی واقعی نشان داده می‌شود
+            for user in users:
+                uid = user["uid"]
+                ips = active_connections.get(uid, {})
+                ip_count = len(ips) if ips else 1
+                items.append({"config": config_label, "label": user["label"], "ip_count": ip_count, "attributed": True})
         else:
-            items.append({"config": label, "label": " / ".join(other_labels), "ip_count": ip_count, "attributed": False})
+            # برای بقیه پروتکل‌ها: تعداد ایپی از لاگ Nginx (اگر موجود باشد)
+            ip_count = len(protocol_connections.get(proto, {})) or len(users)
+            if len(users) == 1:
+                items.append({"config": config_label, "label": users[0]["label"], "ip_count": ip_count, "attributed": True})
+            else:
+                labels = [u["label"] for u in users[:5]]
+                items.append({"config": config_label, "label": " / ".join(labels), "ip_count": ip_count, "attributed": False})
     return items
 
 def format_active_configs_text(items):
