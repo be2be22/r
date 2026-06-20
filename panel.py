@@ -91,6 +91,7 @@ TAG_TO_PROTO = {
     "ws-in": "ws", "xhttp-in": "xhttp", "grpc-in": "grpc",
     "hu-in": "hu", "trojan-in": "trojan", "vmess-in": "vmess", "reality-in": "reality",
 }
+PROTO_TO_TAG = {v: k for k, v in TAG_TO_PROTO.items()}  # reverse: proto -> tag
 CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")  # RFC 6598 - Shared/CGNAT Address Space (یک‌بار ساخته می‌شود، نه هر بار)
 
 # فرمت لاگ Xray بسته به نسخه فرق دارد:
@@ -305,7 +306,15 @@ async def stats_updater():
                         if uid not in user_traffic: user_traffic[uid] = 0
                         user_traffic[uid] += value
                         stats["bytes"] += value
-                        if value > 0: user_last_active[uid] = time.time()
+                        if value > 0:
+                            user_last_active[uid] = time.time()
+                            # اگر mapping پروتکل این کاربر رو قبلاً از لاگ Xray یاد گرفتیم،
+                            # timestamp رو refresh کن — ولی فقط اگه inbound اون پروتکل هم فعال باشه
+                            if uid in user_protocol_active:
+                                for p in list(user_protocol_active[uid].keys()):
+                                    t = PROTO_TO_TAG.get(p)
+                                    if t and time.time() - inbound_last_active.get(t, 0) < 30:
+                                        user_protocol_active[uid][p] = time.time()
                     elif len(parts) == 4 and parts[0] == "inbound" and parts[2] == "traffic":
                         # این شمارنده مستقیماً از خود Xray می‌آید، پس بدون توجه به اینکه Nginx ایپی واقعی
                         # کاربر را نشان می‌دهد یا نه، دقیقاً می‌فهمیم همین الان از کدام پروتکل ترافیک رد شده.
@@ -615,13 +624,15 @@ def fmt_speed(bps):
 def build_active_configs():
     """
     لیست کانفیگ‌های آنلاین را می‌سازد.
-    از user_protocol_active استفاده می‌کند که دقیقاً مشخص می‌کند کدام کاربر به کدام پروتکل وصل است.
-    این اطلاعات مستقیماً از لاگ Xray (تگ inbound + ایمیل کاربر) استخراج شده و ۱۰۰٪ دقیق است.
+    اول: از user_protocol_active استفاده می‌کند (mapping دقیق از لاگ Xray).
+    بعد: برای کاربرانی که mapping ندارند ولی آنلاین هستند (مثلاً قبل از شروع پنل وصل شده‌اند)
+    از inbound_last_active + user_last_active به‌عنوان fallback استفاده می‌کند.
     """
     items = []
     now = time.time()
+    mapped_uids = set()  # کاربرانی که mapping دقیق دارند
 
-    # ساخت نگاشت پروتکل -> لیست کاربران از روی user_protocol_active
+    # ──── مرحله ۱: کاربران با mapping دقیق (از لاگ Xray) ────
     proto_users = {}  # protocol -> [{"uid": ..., "label": ...}]
     for uid, protos in user_protocol_active.items():
         if uid not in LINKS: continue
@@ -631,26 +642,41 @@ def build_active_configs():
             if proto not in proto_users:
                 proto_users[proto] = []
             proto_users[proto].append({"uid": uid, "label": label})
+            mapped_uids.add(uid)
 
     for proto, users in proto_users.items():
         if not users: continue
         config_label = PROTOCOL_LABELS.get(proto, proto)
 
         if proto == "reality":
-            # برای Reality: هر کاربر جداگانه با تعداد ایپی واقعی نشان داده می‌شود
             for user in users:
                 uid = user["uid"]
                 ips = active_connections.get(uid, {})
                 ip_count = len(ips) if ips else 1
                 items.append({"config": config_label, "label": user["label"], "ip_count": ip_count, "attributed": True})
         else:
-            # برای بقیه پروتکل‌ها: تعداد ایپی از لاگ Nginx (اگر موجود باشد)
             ip_count = len(protocol_connections.get(proto, {})) or len(users)
             if len(users) == 1:
                 items.append({"config": config_label, "label": users[0]["label"], "ip_count": ip_count, "attributed": True})
             else:
                 labels = [u["label"] for u in users[:5]]
                 items.append({"config": config_label, "label": " / ".join(labels), "ip_count": ip_count, "attributed": False})
+
+    # ──── مرحله ۲: fallback برای کاربران بدون mapping ────
+    # کاربرانی که آنلاین هستند (Stats API) ولی هنوز خط accepted لاگ Xray برایشان ثبت نشده
+    unmapped_online = [uid for uid in user_last_active if uid in LINKS and uid not in mapped_uids]
+    if unmapped_online:
+        unmapped_labels = [LINKS[uid].get("label", uid[:8]) for uid in unmapped_online]
+        active_protocols = [proto for tag, proto in TAG_TO_PROTO.items()
+                            if now - inbound_last_active.get(tag, 0) < 30
+                            and proto not in proto_users]  # فقط پروتکل‌هایی که قبلاً ثبت نشدند
+        for proto in active_protocols:
+            config_label = PROTOCOL_LABELS.get(proto, proto)
+            ip_count = len(protocol_connections.get(proto, {})) or len(unmapped_online)
+            if len(unmapped_online) == 1:
+                items.append({"config": config_label, "label": unmapped_labels[0], "ip_count": ip_count, "attributed": True})
+            else:
+                items.append({"config": config_label, "label": " / ".join(unmapped_labels[:5]), "ip_count": ip_count, "attributed": False})
     return items
 
 def format_active_configs_text(items):
