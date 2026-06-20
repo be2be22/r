@@ -23,20 +23,6 @@ NGINX_LOG    = "/tmp/nginx_access.log"
 STATS_FILE   = "/app/stats.json"
 XRAY_API_PORT = 10085
 
-# ── سقف‌های مصرف برای کارت‌های CPU Score / RAM Efficiency / Network Load Index ──
-# این کارت‌ها مقدار «مصرف‌شده» و «باقی‌مانده» را مستقیماً از API خود ریلوی (همان صفحه‌ی
-# Usage که در عکس فرستادی) می‌خوانند. برای RAM، ریلوی خودش سقف واقعی (MEMORY_LIMIT_GB)
-# را برمی‌گرداند. اما CPU و Network egress روی ریلوی سقف سخت‌افزاری ثابتی ندارند (مصرفی و
-# Pay-as-you-go هستند)، پس سقفشان را خودت با همین Variable ها تنظیم می‌کنی تا «باقی‌مانده»
-# منطقی محاسبه شود:
-#   CPU_LIMIT_VCPU        → سقف vCPU که برای این سرویس در Settings → Resource Limits ریلوی گذاشتی
-#   NETWORK_EGRESS_LIMIT_GB → سقف ترافیک خروجی ماهانه‌ای که خودت در نظر می‌گیری (بر اساس بودجه‌ت)
-CPU_LIMIT_VCPU = float(os.environ.get("CPU_LIMIT_VCPU", "1"))
-NETWORK_EGRESS_LIMIT_GB = float(os.environ.get("NETWORK_EGRESS_LIMIT_GB", "10"))
-# اگر تست اتصال (دکمه تست ریلوی در تنظیمات) اسم enum درست CPU را نشان داد و با حدس‌های خودکار
-# پنل فرق داشت، همان اسم را اینجا با Variable ست کن تا دیگر نیازی به تغییر کد نباشد:
-CPU_METRIC_FIELD_NAME = os.environ.get("CPU_METRIC_FIELD_NAME", "").strip()
-
 XRAY_WS_PORT = 18080
 XRAY_XH_PORT = 18081
 XRAY_GRPC_PORT = 18083
@@ -86,10 +72,7 @@ reality_keys = {"priv": "", "pub": ""}
 railway_metrics = {"available": False, "ram_pct": 0, "mem_used_gb": 0, "mem_limit_gb": 0,
                     "net_bytes": 0, "net_rx_gb": 0, "net_tx_gb": 0,
                     "disk_used_gb": 0, "disk_limit_gb": 0, "disk_pct": 0, "updated": 0,
-                    "net_rx_total_gb": 0, "net_tx_total_gb": 0, "net_rx_last_ts": 0, "net_tx_last_ts": 0,
-                    # متریک CPU واقعی ریلوی — جدا از بقیه fetch می‌شود تا اگر اسم فیلدش روی
-                    # حساب شما فرق داشت، فقط همین بخش غیرفعال شود و رم/ترافیک سالم بمانند.
-                    "cpu_available": False, "cpu_used_vcpu": 0, "cpu_field_name": None, "cpu_warned": False}
+                    "net_rx_total_gb": 0, "net_tx_total_gb": 0, "net_rx_last_ts": 0, "net_tx_last_ts": 0}
 
 RATE_LIMITS = {}
 tg_client = None
@@ -565,76 +548,6 @@ async def fetch_railway_metrics():
     except Exception as e:
         log_err(f"railway_metrics_error: {e}")
         railway_metrics["available"] = False
-        return
-
-    # ── CPU واقعی ریلوی (جدا و ایزوله) ──────────────────────────────────────
-    # کاملاً مستقل از بخش بالا اجرا می‌شود: اگر اسم enum درست برای CPU روی اسکیمای شما
-    # فرق داشته باشد، فقط همین خطا می‌خورد و available شدن رم/ترافیک بالا را خراب نمی‌کند.
-    try:
-        cpu_now = datetime.utcnow()
-        cpu_start = cpu_now - timedelta(minutes=10)
-        cpu_query = """
-        query Metrics($measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime, $environmentId: String, $serviceId: String) {
-          metrics(measurements: $measurements, startDate: $startDate, endDate: $endDate, environmentId: $environmentId, serviceId: $serviceId) {
-            measurement
-            values { ts value }
-          }
-        }
-        """
-
-        async def try_cpu_field(field_name: str):
-            variables = {
-                "measurements": [field_name],
-                "startDate": cpu_start.isoformat() + "Z",
-                "endDate": cpu_now.isoformat() + "Z",
-                "environmentId": RAILWAY_ENVIRONMENT_ID,
-                "serviceId": RAILWAY_SERVICE_ID,
-            }
-            async with httpx.AsyncClient(timeout=10) as client2:
-                resp2 = await client2.post(
-                    RAILWAY_GRAPHQL_URL,
-                    json={"query": cpu_query, "variables": variables},
-                    headers={"Authorization": f"Bearer {RAILWAY_API_TOKEN}", "Content-Type": "application/json"},
-                )
-            body2 = resp2.json()
-            if "errors" in body2:
-                raise Exception(body2["errors"])
-            metrics2 = (body2.get("data") or {}).get("metrics") or []
-            values = metrics2[0].get("values") if metrics2 else []
-            return (values[-1]["value"] if values else 0)
-
-        known_field = railway_metrics.get("cpu_field_name")
-        if known_field and known_field != "__exhausted__":
-            # اسم فیلد درست از قبل پیدا شده؛ فقط همان را دوباره می‌خوانیم (یک درخواست، نه حدس‌زنی دوباره)
-            cpu_used = await try_cpu_field(known_field)
-            railway_metrics["cpu_used_vcpu"] = round(cpu_used, 3)
-            railway_metrics["cpu_available"] = True
-        elif known_field is None:
-            # هنوز اسم درست پیدا نشده؛ اول اسم دستی (اگر ست شده)، بعد چند گزینه‌ی محتمل را امتحان می‌کنیم
-            found = False
-            candidates = ([CPU_METRIC_FIELD_NAME] if CPU_METRIC_FIELD_NAME else []) + \
-                         ["CPU_USAGE", "CPU_USAGE_VCPU", "CPU_USAGE_CORES", "CPU_USAGE_PERCENT"]
-            for candidate in candidates:
-                try:
-                    cpu_used = await try_cpu_field(candidate)
-                    railway_metrics["cpu_field_name"] = candidate
-                    railway_metrics["cpu_used_vcpu"] = round(cpu_used, 3)
-                    railway_metrics["cpu_available"] = True
-                    found = True
-                    break
-                except Exception:
-                    continue
-            if not found:
-                railway_metrics["cpu_field_name"] = "__exhausted__"
-                railway_metrics["cpu_available"] = False
-                if not railway_metrics.get("cpu_warned"):
-                    log_err("railway_cpu_metric_unavailable: هیچ‌کدام از نام‌های محتمل CPU روی اسکیمای ریلوی شما کار نکرد؛ کارت CPU Score از مقدار محلی (proc/stat) به‌عنوان تخمین استفاده می‌کند.")
-                    railway_metrics["cpu_warned"] = True
-    except Exception as e:
-        railway_metrics["cpu_available"] = False
-        if not railway_metrics.get("cpu_warned"):
-            log_err(f"railway_cpu_metric_error: {e}")
-            railway_metrics["cpu_warned"] = True
 
 async def railway_metrics_updater():
     if not RAILWAY_API_TOKEN or not RAILWAY_SERVICE_ID or not RAILWAY_ENVIRONMENT_ID:
@@ -831,45 +744,6 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     active_configs = build_active_configs()
     total_active_ips = sum(it["ip_count"] for it in active_configs)
-
-    # ── CPU Score / RAM Efficiency / Network Load Index ─────────────────────
-    # این سه مقدار از همان دیتای واقعی API ریلوی (صفحه‌ی Usage) می‌آیند، نه از proc محلی،
-    # و به‌جای درصد، مقدار واقعی «مصرف‌شده» و «باقی‌مانده» برمی‌گردانند.
-
-    # RAM: ریلوی خودش هم مصرف و هم سقف واقعی (Resource Limit) را برمی‌گرداند
-    if railway_metrics["available"] and railway_metrics.get("mem_limit_gb"):
-        ram_used_gb = railway_metrics["mem_used_gb"]
-        ram_limit_gb = railway_metrics["mem_limit_gb"]
-        ram_remaining_gb = max(0, round(ram_limit_gb - ram_used_gb, 3))
-        ram_source = "railway"
-    else:
-        # فال‌بک: اگر هنوز کانکشن به ریلوی برقرار نشده، از درصد محلی proc/stat تخمین می‌زنیم
-        ram_used_gb = round(sys_info["ram"] / 100 * 1, 3)  # تخمین تقریبی روی فرض سقف ۱ گیگ
-        ram_limit_gb = 1
-        ram_remaining_gb = max(0, round(ram_limit_gb - ram_used_gb, 3))
-        ram_source = "estimate"
-
-    # CPU: مصرف واقعی vCPU را از ریلوی می‌خواند؛ سقفش از Variable قابل‌تنظیم CPU_LIMIT_VCPU می‌آید
-    # (ریلوی خودش سقف سخت‌افزاری ثابتی برای vCPU گزارش نمی‌کند، چون پلن‌ها burstable هستند)
-    if railway_metrics.get("cpu_available"):
-        cpu_used_vcpu = railway_metrics["cpu_used_vcpu"]
-        cpu_source = "railway"
-    else:
-        # فال‌بک تخمینی از درصد محلی proc/stat (وقتی فیلد CPU روی اسکیمای ریلوی پیدا نشود)
-        cpu_used_vcpu = round(sys_info["cpu"] / 100 * CPU_LIMIT_VCPU, 3)
-        cpu_source = "estimate"
-    cpu_remaining_vcpu = max(0, round(CPU_LIMIT_VCPU - cpu_used_vcpu, 3))
-
-    # Network egress: مصرف تجمعی واقعی (از زمان بالا آمدن پنل) از ریلوی؛ سقفش از Variable
-    # قابل‌تنظیم NETWORK_EGRESS_LIMIT_GB (چون ریلوی خودش روی ترافیک خروجی سقف سخت ندارد)
-    if railway_metrics["available"]:
-        net_used_gb = round(railway_metrics["net_rx_gb"] + railway_metrics["net_tx_gb"], 3)
-        net_source = "railway"
-    else:
-        net_used_gb = round(stats["bytes"] / (1024 ** 3), 3)
-        net_source = "estimate"
-    net_remaining_gb = max(0, round(NETWORK_EGRESS_LIMIT_GB - net_used_gb, 3))
-
     return {
         "total_users": len(LINKS),
         "total_connected": len(total_unique_ips),
@@ -881,12 +755,6 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
         "uptime": uptime_str(),
         "ram": sys_info["ram"],
         "cpu": sys_info["cpu"],
-        "cpu_used_vcpu": cpu_used_vcpu, "cpu_limit_vcpu": CPU_LIMIT_VCPU,
-        "cpu_remaining_vcpu": cpu_remaining_vcpu, "cpu_source": cpu_source,
-        "ram_used_gb": ram_used_gb, "ram_limit_gb": ram_limit_gb,
-        "ram_remaining_gb": ram_remaining_gb, "ram_source": ram_source,
-        "net_used_gb": net_used_gb, "net_limit_gb": NETWORK_EGRESS_LIMIT_GB,
-        "net_remaining_gb": net_remaining_gb, "net_source": net_source,
         "active_configs": active_configs,
         "railway_available": railway_metrics["available"],
         "railway_ram_pct": railway_metrics["ram_pct"],
@@ -1035,23 +903,6 @@ async def railway_test(token: Optional[str] = Cookie(None)):
         out["result"] = "موفق ✓" if metrics else "اتصال موفق بود اما هیچ متریکی برنگشت (ممکن است بازه زمانی داده نداشته باشد یا اشتراک ریلوی این داده را ندهد)."
         out["measurements_returned"] = [m.get("measurement") for m in metrics]
         out["sample"] = metrics
-
-        # وضعیت CPU جدا گزارش می‌شود (چون با حدس اسم enum پیدا شده، نه قطعی)
-        out["cpu_metric_status"] = {
-            "available": railway_metrics.get("cpu_available"),
-            "field_name_used": railway_metrics.get("cpu_field_name"),
-            "used_vcpu": railway_metrics.get("cpu_used_vcpu"),
-        }
-        # اگر CPU پیدا نشده، لیست enum واقعی MetricMeasurement را می‌آوریم تا مستقیم اسم درست را ببینی
-        if not railway_metrics.get("cpu_available"):
-            try:
-                introspect = await railway_introspect()
-                for t in introspect.get("metric_types", []):
-                    if t.get("name") == "MetricMeasurement" and t.get("enumValues"):
-                        out["available_measurement_enum_values"] = t["enumValues"]
-                        out["hint"] = "از این لیست هر اسمی که مربوط به CPU است (مثلاً چیزی شامل CPU) را پیدا کن و دقیقاً همان را در Variable به نام CPU_METRIC_FIELD_NAME ست کن، بعد سرویس را Redeploy کن — دیگر نیازی به تغییر کد نیست."
-            except Exception:
-                pass
         return out
     except httpx.RequestError as e:
         out["result"] = f"خطای شبکه در اتصال به ریلوی: {e}"
@@ -1276,9 +1127,6 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
     <div class="stat-card"><div class="stat-icon">⚙️</div><div class="stat-val" id="s-cpu">—</div><div class="stat-label">پردازنده (%)</div></div>
     <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-railway-ram">—</div><div class="stat-label">رم ریلوی (%)</div></div>
     <div class="stat-card"><div class="stat-icon">💾</div><div class="stat-val" id="s-railway-disk">—</div><div class="stat-label">دیسک کانتینر</div></div>
-    <div class="stat-card"><div class="stat-icon">⚡</div><div class="stat-val" id="s-cpu-score">—</div><div class="stat-label">CPU Score (مصرف/باقی‌مانده)</div></div>
-    <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-ram-efficiency">—</div><div class="stat-label">RAM Efficiency (مصرف/باقی‌مانده)</div></div>
-    <div class="stat-card"><div class="stat-icon">🌐</div><div class="stat-val" id="s-network-load">—</div><div class="stat-label">Network Load Index (مصرف/باقی‌مانده)</div></div>
   </div>
 
   <!-- باکس کانفیگ‌های فعال -->
@@ -1303,8 +1151,6 @@ var allUsers = {};
 function toggleDarkMode(){document.body.classList.toggle('dark');let isDark=document.body.classList.contains('dark');let icon=isDark?'☀️':'🌙';let btnDesktop=document.getElementById('theme-btn-desktop');let btnMobile=document.getElementById('theme-btn-mobile');if(btnDesktop)btnDesktop.textContent=icon;if(btnMobile)btnMobile.textContent=icon;}
 function fmtBytes(b){if(!b||b<1024)return(b||0)+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(2)+' MB';return(b/1073741824).toFixed(2)+' GB';}
 function fmtSpeed(bps){if(!bps||bps<1024)return(bps||0)+' B/s';if(bps<1048576)return(bps/1024).toFixed(1)+' KB/s';if(bps<1073741824)return(bps/1048576).toFixed(2)+' MB/s';return(bps/1073741824).toFixed(2)+' GB/s';}
-function fmtGBVal(gb){gb=gb||0;if(Math.abs(gb)<1)return Math.round(gb*1024)+'MB';return gb.toFixed(2)+'GB';}
-function fmtVcpuVal(v){v=v||0;return v.toFixed(2)+' vCPU';}
 function showPage(n,e){document.querySelectorAll('.page').forEach(function(p){p.classList.remove('active')});document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});document.getElementById('page-'+n).classList.add('active');e.classList.add('active');if(n==='users')loadUsers();if(n==='logs')loadLogs();}
 async function logout(){await fetch('/api/logout',{method:'POST'});location.href='__LOGIN_URL__';}
 async function loadStats(){try{const r=await fetch('/api/stats',{credentials:'include'});if(r.status===401){location.href='__LOGIN_URL__';return}const d=await r.json();
@@ -1318,9 +1164,6 @@ document.getElementById('s-ram').textContent=d.ram+'%';
 document.getElementById('s-cpu').textContent=d.cpu+'%';
 document.getElementById('s-total-combined').textContent=fmtBytes(d.combined_bytes);
 document.getElementById('s-railway-disk').textContent=d.disk_used_gb+' / '+d.disk_total_gb+' GB ('+d.disk_pct+'%)';
-document.getElementById('s-cpu-score').textContent=fmtVcpuVal(d.cpu_used_vcpu)+' / '+fmtVcpuVal(d.cpu_remaining_vcpu)+(d.cpu_source==='estimate'?' (تخمینی)':'');
-document.getElementById('s-ram-efficiency').textContent=fmtGBVal(d.ram_used_gb)+' / '+fmtGBVal(d.ram_remaining_gb)+(d.ram_source==='estimate'?' (تخمینی)':'');
-document.getElementById('s-network-load').textContent=fmtGBVal(d.net_used_gb)+' / '+fmtGBVal(d.net_remaining_gb)+(d.net_source==='estimate'?' (تخمینی)':'');
 if(d.railway_available){
 document.getElementById('s-railway-traffic').textContent=fmtBytes(d.railway_net_bytes);
 document.getElementById('s-railway-ram').textContent=d.railway_ram_pct+'%';
